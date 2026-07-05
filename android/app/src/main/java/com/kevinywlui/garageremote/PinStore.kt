@@ -15,11 +15,11 @@ object PinStore {
     private const val KEY = "pin_secret"
     const val SECRET_LEN = 16
 
-    // Policy for newly entered PINs only (client-side; the protocol and
-    // already-provisioned secrets are unaffected). Raised from 4 per panel
-    // review: the secret is a truncated SHA-256 of the PIN, so a leaked
-    // secret gives up a short PIN to brute force instantly.
-    const val MIN_PIN_LENGTH = 6
+    // Hard floor for newly entered PINs; 6+ is recommended in the UI but
+    // not enforced — boards already provisioned with a 4-digit PIN must
+    // stay reachable, so length is guidance, not a gate.
+    const val MIN_PIN_LENGTH = 4
+    const val RECOMMENDED_PIN_LENGTH = 6
 
     fun isSet(context: Context): Boolean = prefs(context).contains(KEY)
 

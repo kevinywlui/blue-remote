@@ -12,11 +12,11 @@
 //      write from the bonded phone is stored in flash; from then on every
 //      write must match it or the connection is dropped.
 //
-// Factory reset (new phone): with the board running, hold the BOOT
-// button ~3s until the LED blinks. This erases the bond and the stored
-// secret; the next device to connect becomes the owner. (BOOT is GPIO9,
-// a strapping pin — holding it during power-up would enter the serial
-// bootloader instead, which is why the hold is detected at runtime.)
+// Factory reset (new phone): erase and re-flash over USB —
+// `pio run -t erase` then `pio run -t upload` — which wipes the bond and
+// the stored secret; the next device to connect becomes the owner.
+// Optionally, a momentary button wired from GPIO9 to GND (not populated
+// on all boards) held ~3s at runtime does the same without a computer.
 
 #include <Arduino.h>
 #include <NimBLEDevice.h>
@@ -27,7 +27,9 @@ static const char* SERVICE_UUID = "4090b92d-a8da-471a-85a8-aee612b68bad";
 static const char* TRIGGER_CHAR_UUID = "588a322e-4b88-4197-8f4e-a5f48417c8b7";
 
 static const uint8_t TRIGGER_PIN = D0;
-static const uint8_t RESET_BUTTON_PIN = 9;    // BOOT button, active low
+// Optional factory-reset button (GPIO9 to GND, active low). Harmless when
+// absent: INPUT_PULLUP keeps the pin high.
+static const uint8_t RESET_BUTTON_PIN = 9;
 static const uint32_t PULSE_MS = 400;         // how long the "button" is held
 static const uint32_t COOLDOWN_MS = 2000;     // min gap between pulses
 static const uint32_t RESET_HOLD_MS = 3000;
@@ -182,7 +184,8 @@ void setup() {
                   (int)knownBonds.size(), provisioned ? "yes" : "no");
 }
 
-// Millis timestamp when BOOT was first seen held; 0 = not held.
+// Millis timestamp when the optional reset button was first seen held;
+// 0 = not held.
 static uint32_t buttonHeldSince = 0;
 
 void loop() {

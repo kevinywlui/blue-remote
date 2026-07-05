@@ -90,8 +90,8 @@ fun PinEntryScreen(
                     Spacer(Modifier.width(12.dp))
                     Text(
                         "A board provisioned with your current PIN must be factory-reset " +
-                            "(hold BOOT ~3s) before a new PIN works — and the old pairing " +
-                            "removed in your phone's Bluetooth settings.",
+                            "(erase and re-flash it over USB) before a new PIN works — and " +
+                            "the old pairing removed in your phone's Bluetooth settings.",
                         style = MaterialTheme.typography.bodyMedium,
                     )
                 }
@@ -100,7 +100,7 @@ fun PinEntryScreen(
         } else {
             Text(
                 "The first PIN used with a fresh board becomes its key. " +
-                    "Use 6+ digits you don't use anywhere else.",
+                    "6+ digits recommended — don't reuse a PIN from anywhere else.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
@@ -108,21 +108,28 @@ fun PinEntryScreen(
             Spacer(Modifier.height(16.dp))
         }
 
+        val belowRecommended = pin.length in PinStore.MIN_PIN_LENGTH until PinStore.RECOMMENDED_PIN_LENGTH
         OutlinedTextField(
             value = pin,
             onValueChange = { new -> pin = new.filter { it.isDigit() }.take(12) },
-            label = { Text("PIN (${PinStore.MIN_PIN_LENGTH}+ digits)") },
+            label = { Text("PIN") },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
             visualTransformation = PasswordVisualTransformation(),
             singleLine = true,
             isError = tooShort,
             supportingText = {
-                if (tooShort) {
-                    Text(
+                when {
+                    tooShort -> Text(
                         "At least ${PinStore.MIN_PIN_LENGTH} digits",
                         modifier = Modifier.semantics {
                             error("PIN too short — at least ${PinStore.MIN_PIN_LENGTH} digits")
                         },
+                    )
+                    // Recommendation only — Save stays enabled (§: length is
+                    // guidance; a board provisioned with a short PIN must
+                    // stay reachable).
+                    belowRecommended -> Text(
+                        "${PinStore.RECOMMENDED_PIN_LENGTH}+ digits recommended for security",
                     )
                 }
             },
@@ -152,9 +159,9 @@ fun PinEntryScreen(
             text = {
                 Text(
                     "If the board was already set up with your current PIN, it will stop " +
-                        "responding until you factory-reset it (hold BOOT ~3s). The old PIN " +
-                        "cannot be recovered. Afterwards, also remove the old pairing in " +
-                        "your phone's Bluetooth settings.",
+                        "responding until you factory-reset it (erase and re-flash over " +
+                        "USB). The old PIN cannot be recovered. Afterwards, also remove " +
+                        "the old pairing in your phone's Bluetooth settings.",
                 )
             },
             // Cancel is the filled, end-position action; the destructive verb

@@ -15,7 +15,7 @@ blue-remote/
 **First-time setup**
 1. Flash the board and power it near the phone.
 2. Install the app; grant Bluetooth permissions on first launch.
-3. Choose a PIN (6+ digits) and save it.
+3. Choose a PIN and save it (6+ digits recommended).
 4. The app scans and connects; confirm Android's pairing dialog.
 5. Press the big button — the first press provisions the PIN into the
    board and pulses the door.
@@ -35,8 +35,9 @@ blue-remote/
   was provisioned with.
 
 **Switch phones / factory reset**
-1. With the board running, hold BOOT ~3s until the LED blinks (erases
-   bond + stored secret).
+1. Erase and re-flash the board over USB (`pio run -t erase`, then
+   `pio run -t upload` in `firmware/`) — this wipes the bond and stored
+   secret.
 2. Remove the pairing from the old phone's Bluetooth settings.
 3. On the new phone: install the app, enter the same (or a new) PIN,
    connect, and press.
@@ -83,14 +84,22 @@ close permanently.
 
 ### Switching phones / factory reset
 
-With the board **powered and running**, hold the **BOOT button** (the
-tiny "B" button) ~3s until the yellow LED blinks. This erases the bond
-and the stored secret. Don't hold it while plugging in power — BOOT is a
-strapping pin, and holding it through power-up puts the chip in the
-serial bootloader instead of running the firmware.
+Erase and re-flash the board over USB:
+
+```sh
+cd firmware
+pio run -t erase     # wipes the bond and the stored secret
+pio run -t upload    # re-flash the firmware
+```
+
 On the new phone, enter the **same PIN** (or a new one — the board is
 fresh either way) and connect; it becomes the new owner. Also remove the
 old pairing from the previous phone's Bluetooth settings.
+
+(Optional, no computer needed: wire a momentary button from GPIO9 to GND
+— holding it ~3s while the board runs does the same reset, confirmed by
+the LED blinking. The firmware supports this out of the box; the pin is
+simply unused if no button is fitted.)
 
 Changing the PIN in the app ("Change PIN") only helps *before* the board
 is provisioned — after that, the board expects the original PIN, so a PIN
@@ -120,7 +129,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 1. Power the XIAO.
 2. Open the app, grant the Bluetooth permissions, and choose a PIN
-   (6+ digits) when prompted.
+   (6+ digits recommended) when prompted.
 3. The app scans, connects, and starts pairing; confirm Android's pairing
    dialog. Your phone is now the only device that can bond.
 4. Status becomes "Paired and connected" — the big button is live. The

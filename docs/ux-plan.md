@@ -154,7 +154,7 @@ Constraints:
     there is nothing to preserve — but back must still exit the app
     cleanly rather than loop.
   - **Warning placement**: when a PIN is already set, the factory-reset
-    warning ("a provisioned board must be factory-reset — hold BOOT ~3s
+    warning ("a provisioned board must be factory-reset — erase + re-flash over USB
     — before a new PIN works, **and the old pairing removed in the
     phone's system Bluetooth settings** — the phone keeps the stale
     bond otherwise") is shown inline on the PIN screen,
@@ -166,7 +166,7 @@ Constraints:
     app cannot know whether the board is provisioned (the one legitimate
     Change PIN use case is a freshly reset board): "If the board was
     already set up with your current PIN, it will stop responding until
-    you factory-reset it (hold BOOT ~3s). The old PIN cannot be
+    you factory-reset it (erase + re-flash over USB). The old PIN cannot be
     recovered. Afterwards, also remove the old pairing in your phone's
     Bluetooth settings." Naming the phone-side step at the point of
     commitment is deliberate: the 3-rapid-cycles stale-bond heuristic

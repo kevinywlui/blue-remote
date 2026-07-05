@@ -119,12 +119,13 @@ fun SettingsSheet(
                     "active interceptor.\n\n" +
                     "Saving a PIN here doesn't program the board; your first button press " +
                     "does. The board then answers only to that PIN.\n\n" +
-                    "To switch phones or change the PIN on the board: hold its BOOT button " +
-                    "~3 seconds until the LED blinks (factory reset), and remove the old " +
-                    "pairing in your phone's Bluetooth settings — reconnects fail until the " +
-                    "stale pairing is removed.\n\n" +
+                    "To switch phones or change the PIN on the board: factory-reset it by " +
+                    "erasing and re-flashing the firmware over USB (see the project " +
+                    "README), and remove the old pairing in your phone's Bluetooth " +
+                    "settings — reconnects fail until the stale pairing is removed.\n\n" +
                     "The PIN is stored as a hash that a leaked copy could brute-force " +
-                    "quickly, so use 6+ digits and don't reuse a PIN from anywhere else.",
+                    "quickly, so 6+ digits are recommended — and don't reuse a PIN from " +
+                    "anywhere else.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

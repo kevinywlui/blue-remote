@@ -291,7 +291,7 @@ private fun detailText(cause: ErrorCause): String? = when (cause) {
     ErrorCause.STALE_BOND ->
         "Remove this device's old pairing in your phone's Bluetooth settings, then reconnect."
     ErrorCause.PAIRING_REJECTED ->
-        "The board only bonds to one phone. Factory-reset it (hold BOOT ~3s) to take ownership."
+        "The board only bonds to one phone. Factory-reset it (see \"How pairing works\" in Settings) to take ownership."
     ErrorCause.NOT_FOUND -> "Make sure the board is powered and within range."
     ErrorCause.BLUETOOTH_OFF -> "Turn on Bluetooth to connect."
     ErrorCause.LOCATION_OFF -> "Android needs Location Services on for BLE scanning on this Android version."
