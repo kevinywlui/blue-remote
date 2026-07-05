@@ -17,6 +17,7 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -29,7 +30,6 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import com.kevinywlui.garageremote.ui.MainScreen
 import com.kevinywlui.garageremote.ui.MainScreenActions
-import com.kevinywlui.garageremote.ui.PinEntryScreen
 import com.kevinywlui.garageremote.ui.SettingsSheet
 import com.kevinywlui.garageremote.ui.theme.GarageTheme
 import com.kevinywlui.garageremote.ui.theme.resolveTheme
@@ -84,11 +84,12 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun Root() {
-        val pinSet by vm.pinSet.collectAsState()
         // Saveable: follow-system makes uiMode recreation routine; it must
-        // not close the sheet or eject the user from Change PIN.
-        var changePinOpen by rememberSaveable { mutableStateOf(false) }
+        // not close the sheet.
         var sheetOpen by rememberSaveable { mutableStateOf(false) }
+        // First launch goes straight to the permission request; recreations
+        // (and later denials) recover via the in-screen affordances instead.
+        var permissionsRequested by rememberSaveable { mutableStateOf(false) }
 
         val actions = remember {
             MainScreenActions(
@@ -103,37 +104,21 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-        when {
-            // First launch: PIN entry first, THEN the permission request (§2) —
-            // the dialog must never cover the PIN field.
-            !pinSet || changePinOpen -> PinEntryScreen(
-                pinAlreadySet = pinSet,
-                onSave = { pin ->
-                    val firstLaunch = !pinSet
-                    vm.savePin(pin)
-                    changePinOpen = false
-                    if (firstLaunch || !GarageViewModel.hasPermissions(this)) {
-                        permissionLauncher.launch(GarageViewModel.requiredPermissions())
-                    }
-                },
-                onCancel = { changePinOpen = false },
-            )
-            else -> {
-                MainScreen(vm, actions)
-                if (sheetOpen) {
-                    val theme by vm.theme.collectAsState()
-                    SettingsSheet(
-                        currentTheme = theme,
-                        onThemeSelected = { vm.setTheme(it) },
-                        onChangePin = {
-                            // Sheet dismisses before the PIN screen opens (§2).
-                            sheetOpen = false
-                            changePinOpen = true
-                        },
-                        onDismiss = { sheetOpen = false },
-                    )
-                }
+        LaunchedEffect(Unit) {
+            if (!permissionsRequested && !GarageViewModel.hasPermissions(this@MainActivity)) {
+                permissionsRequested = true
+                permissionLauncher.launch(GarageViewModel.requiredPermissions())
             }
+        }
+
+        MainScreen(vm, actions)
+        if (sheetOpen) {
+            val theme by vm.theme.collectAsState()
+            SettingsSheet(
+                currentTheme = theme,
+                onThemeSelected = { vm.setTheme(it) },
+                onDismiss = { sheetOpen = false },
+            )
         }
     }
 

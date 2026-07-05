@@ -4,14 +4,13 @@ import android.content.Context
 import com.kevinywlui.garageremote.ui.theme.AppTheme
 
 /**
- * Non-secret app state: theme choice, the bonded board's MAC (enables the
- * fast direct-reconnect path), and the one-time first-press hint flag.
+ * App state: theme choice and the bonded board's MAC (enables the fast
+ * direct-reconnect path).
  */
 object AppPrefs {
     private const val PREFS = "garage"
     private const val KEY_THEME = "theme"
     private const val KEY_DEVICE_MAC = "device_mac"
-    private const val KEY_HINT_SEEN = "first_press_hint_seen"
 
     private fun prefs(context: Context) =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -30,12 +29,5 @@ object AppPrefs {
         prefs(context).edit().apply {
             if (mac == null) remove(KEY_DEVICE_MAC) else putString(KEY_DEVICE_MAC, mac)
         }.apply()
-    }
-
-    fun firstPressHintSeen(context: Context): Boolean =
-        prefs(context).getBoolean(KEY_HINT_SEEN, false)
-
-    fun setFirstPressHintSeen(context: Context, seen: Boolean) {
-        prefs(context).edit().putBoolean(KEY_HINT_SEEN, seen).apply()
     }
 }

@@ -28,13 +28,13 @@ import java.util.UUID
 enum class ErrorCause {
     NOT_FOUND, BLUETOOTH_OFF, LOCATION_OFF, PERMISSION_MISSING,
     PERMISSION_DENIED_PERMANENTLY, SCAN_FAILED,
-    PAIRING_REJECTED, STALE_BOND, WRONG_PIN_SUSPECTED, LINK_LOST, NO_TRIGGER_CHAR,
+    PAIRING_REJECTED, STALE_BOND, LINK_LOST, NO_TRIGGER_CHAR,
 }
 
 /**
  * Connection engine. Owns the GATT plumbing and reports what happened via
  * [Listener] events (delivered on the main thread); the ViewModel owns the
- * user-facing state machine, cooldown, and wrong-PIN detection.
+ * user-facing state machine and cooldown.
  *
  * Connect strategy per the UX plan §4: direct connectGatt to the persisted
  * bonded MAC (~10s timeout) first; scan is the setup-only fallback, filtered
@@ -68,6 +68,8 @@ class GarageBleClient(
     companion object {
         val SERVICE_UUID: UUID = UUID.fromString("4090b92d-a8da-471a-85a8-aee612b68bad")
         val TRIGGER_UUID: UUID = UUID.fromString("588a322e-4b88-4197-8f4e-a5f48417c8b7")
+        // The bond is the credential; the payload just says "pulse".
+        private val TRIGGER_PAYLOAD = byteArrayOf(0x01)
         private const val SCAN_TIMEOUT_MS = 15_000L
         private const val DIRECT_CONNECT_TIMEOUT_MS = 10_000L
         private const val GATT_INSUFFICIENT_AUTHENTICATION = 0x5
@@ -97,8 +99,7 @@ class GarageBleClient(
     // True only when the bond receiver observed BOND_BONDED this session —
     // NOT when the session started already-bonded. The app-level write retry
     // exists solely for the fresh-bond/encryption race; in the stale-bond
-    // case (board reset, link never encrypts) a retry would retransmit the
-    // secret in cleartext (§3).
+    // case (board reset, link never encrypts) a retry can't succeed (§3).
     private var newlyBondedThisSession = false
     private var writeRetried = false
     private var discoveryCompleted = false
@@ -157,13 +158,12 @@ class GarageBleClient(
         startScan(macFilter = null)
     }
 
-    fun trigger(secret: ByteArray) {
+    fun trigger() {
         val gatt = gatt
         val characteristic = triggerChar
         if (phase != Phase.CONNECTED || gatt == null || characteristic == null) return
         writeRetried = false
-        if (issueWrite(gatt, characteristic, secret)) {
-            pendingSecret = secret
+        if (issueWrite(gatt, characteristic)) {
             listener.onWriteIssued()
         } else {
             listener.onWriteFailed(-1, insufficientAuth = false)
@@ -179,8 +179,6 @@ class GarageBleClient(
 
     // ------------------------------------------------------------- internals
 
-    private var pendingSecret: ByteArray? = null
-
     private fun toIdle() {
         phase = Phase.IDLE
     }
@@ -195,7 +193,6 @@ class GarageBleClient(
         triggerChar = null
         device = null
         directAttempt = false
-        pendingSecret = null
         toIdle()
     }
 
@@ -285,16 +282,15 @@ class GarageBleClient(
     private fun issueWrite(
         g: BluetoothGatt,
         characteristic: BluetoothGattCharacteristic,
-        secret: ByteArray,
     ): Boolean = if (Build.VERSION.SDK_INT >= 33) {
         g.writeCharacteristic(
-            characteristic, secret, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+            characteristic, TRIGGER_PAYLOAD, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
         ) == BluetoothGatt.GATT_SUCCESS
     } else {
         @Suppress("DEPRECATION")
         run {
             characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            characteristic.value = secret
+            characteristic.value = TRIGGER_PAYLOAD
             g.writeCharacteristic(characteristic)
         }
     }
@@ -355,28 +351,18 @@ class GarageBleClient(
                 val insufficient = status == GATT_INSUFFICIENT_AUTHENTICATION ||
                     status == GATT_INSUFFICIENT_ENCRYPTION
                 when {
-                    status == BluetoothGatt.GATT_SUCCESS -> {
-                        pendingSecret = null
-                        listener.onWriteSuccess()
-                    }
+                    status == BluetoothGatt.GATT_SUCCESS -> listener.onWriteSuccess()
                     // One silent retry, only for the bond-complete-before-
                     // encryption race, only after the bond receiver observed
-                    // BOND_BONDED this session (§3): an unencrypted retry
-                    // would leak the secret.
+                    // BOND_BONDED this session (§3).
                     insufficient && newlyBondedThisSession && !writeRetried -> {
                         writeRetried = true
-                        val secret = pendingSecret
                         val chr = triggerChar
                         val cur = gatt
-                        if (secret != null && chr != null && cur != null &&
-                            issueWrite(cur, chr, secret)
-                        ) return@post
+                        if (chr != null && cur != null && issueWrite(cur, chr)) return@post
                         listener.onWriteFailed(status, insufficientAuth = true)
                     }
-                    else -> {
-                        pendingSecret = null
-                        listener.onWriteFailed(status, insufficientAuth = insufficient)
-                    }
+                    else -> listener.onWriteFailed(status, insufficientAuth = insufficient)
                 }
             }
         }
@@ -401,7 +387,6 @@ class GarageBleClient(
         unregisterBondReceiver()
         handler.removeCallbacks(directTimeout)
         directAttempt = false
-        pendingSecret = null
         toIdle()
         if (!wasConnectingOrUp) return
 

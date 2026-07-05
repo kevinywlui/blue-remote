@@ -91,8 +91,6 @@ class MainScreenActions(
 @Composable
 fun MainScreen(vm: GarageViewModel, actions: MainScreenActions) {
     val state by vm.uiState.collectAsState()
-    val pinSet by vm.pinSet.collectAsState()
-    val hintSeen by vm.firstPressHintSeen.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
     val context = LocalContext.current
     val reducedMotion = remember {
@@ -135,15 +133,6 @@ fun MainScreen(vm: GarageViewModel, actions: MainScreenActions) {
                 SecondaryDetail(state)
                 Spacer(Modifier.height(40.dp))
                 BigButton(vm, state, reducedMotion, actions)
-                Spacer(Modifier.height(24.dp))
-                if (pinSet && !hintSeen) {
-                    Text(
-                        text = "Your first press registers this PIN with a fresh board.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center,
-                    )
-                }
             }
         }
     }
@@ -191,7 +180,6 @@ private fun chipErrorLabel(cause: ErrorCause): String = when (cause) {
     ErrorCause.SCAN_FAILED -> "Scan failed"
     ErrorCause.PAIRING_REJECTED -> "Pairing failed"
     ErrorCause.STALE_BOND -> "Pairing out of date"
-    ErrorCause.WRONG_PIN_SUSPECTED -> "Board rejected the PIN"
     ErrorCause.LINK_LOST -> "Connection lost"
     ErrorCause.NO_TRIGGER_CHAR -> "Unexpected device"
 }
@@ -286,8 +274,6 @@ private fun SecondaryDetail(state: UiState) {
 }
 
 private fun detailText(cause: ErrorCause): String? = when (cause) {
-    ErrorCause.WRONG_PIN_SUSPECTED ->
-        "The board may have been provisioned with a different PIN. See \"How pairing works\" in Settings for the factory-reset steps."
     ErrorCause.STALE_BOND ->
         "Remove this device's old pairing in your phone's Bluetooth settings, then reconnect."
     ErrorCause.PAIRING_REJECTED ->

@@ -24,8 +24,7 @@ import kotlinx.coroutines.launch
 
 data class ErrorInfo(val cause: ErrorCause) {
     val securityRelevant: Boolean
-        get() = cause == ErrorCause.WRONG_PIN_SUSPECTED ||
-            cause == ErrorCause.STALE_BOND ||
+        get() = cause == ErrorCause.STALE_BOND ||
             cause == ErrorCause.PAIRING_REJECTED
 }
 
@@ -83,21 +82,12 @@ class GarageViewModel(app: Application) :
     private val _uiState = MutableStateFlow<UiState>(UiState.Idle())
     val uiState: StateFlow<UiState> = _uiState.asStateFlow()
 
-    private val _pinSet = MutableStateFlow(PinStore.isSet(appContext))
-    val pinSet: StateFlow<Boolean> = _pinSet.asStateFlow()
-
-    private val _firstPressHintSeen = MutableStateFlow(AppPrefs.firstPressHintSeen(appContext))
-    val firstPressHintSeen: StateFlow<Boolean> = _firstPressHintSeen.asStateFlow()
-
     // One-shot events; a Channel buffers across recreation (plan §3).
     private val snackChannel = Channel<SnackEvent>(
         capacity = Channel.BUFFERED, onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
     val snackbars: Flow<SnackEvent> = snackChannel.receiveAsFlow()
 
-    // Cleared on every exit from TRIGGERING/COOLDOWN; only an unexpected
-    // disconnect that itself ends those states fires the wrong-PIN detector.
-    private var triggerInFlight = false
     private var cooldownJob: Job? = null
 
     // Persisted security guidance; survives stop/start, shown as READY's
@@ -119,16 +109,12 @@ class GarageViewModel(app: Application) :
         AppPrefs.setTheme(appContext, theme)
     }
 
-    fun preconditionsOk(): Boolean =
-        _pinSet.value && hasPermissions(appContext)
-
     /** User-initiated connect (button/chip retry). */
     fun connect() {
         if (!hasPermissions(appContext)) {
             setIdle(ErrorInfo(ErrorCause.PERMISSION_MISSING))
             return
         }
-        if (!_pinSet.value) return
         if (_uiState.value !is UiState.Idle) return
         client.connect(userInitiated = true)
     }
@@ -153,22 +139,7 @@ class GarageViewModel(app: Application) :
 
     fun trigger() {
         if (_uiState.value !is UiState.Ready) return
-        val secret = PinStore.get(appContext)
-        if (secret == null) {
-            snack("Set a PIN first")
-            return
-        }
-        client.trigger(secret)
-    }
-
-    fun savePin(pin: String) {
-        PinStore.set(appContext, pin)
-        _pinSet.value = true
-        lastSecurityError = null
-        // Post-factory-reset flow re-provisions on the next press, so the
-        // first-press hint is true again (§2).
-        AppPrefs.setFirstPressHintSeen(appContext, false)
-        _firstPressHintSeen.value = false
+        client.trigger()
     }
 
     /** Set right before launching ACTION_REQUEST_ENABLE / settings deep links (§4). */
@@ -186,7 +157,7 @@ class GarageViewModel(app: Application) :
         systemActivityInFlight = false
         systemActivityTimeoutJob?.cancel()
         maybeRunPendingTeardown()
-        if (started && preconditionsOk() && _uiState.value is UiState.Idle) {
+        if (started && hasPermissions(appContext) && _uiState.value is UiState.Idle) {
             client.connect()
         }
     }
@@ -198,7 +169,7 @@ class GarageViewModel(app: Application) :
         graceJob?.cancel()
         hardCapJob?.cancel() // a cap armed in the background must not fire post-return
         teardownPending = false
-        if (preconditionsOk() && _uiState.value is UiState.Idle) {
+        if (hasPermissions(appContext) && _uiState.value is UiState.Idle) {
             client.connect()
         } else {
             surfaceMissingPermission()
@@ -215,7 +186,7 @@ class GarageViewModel(app: Application) :
     }
 
     override fun onCleared() {
-        // Terminal: no UI left for the TOFU flow; a held GATT occupies the
+        // Terminal: no UI left for the bonding flow; a held GATT occupies the
         // board's single connection slot. No guards apply (§4). close()
         // also releases the client's lifetime adapter receiver.
         client.close()
@@ -271,7 +242,7 @@ class GarageViewModel(app: Application) :
     }
 
     override fun onFailed(cause: ErrorCause) {
-        clearTriggerFlag()
+        cooldownJob?.cancel()
         setIdle(ErrorInfo(cause))
         when (cause) {
             ErrorCause.NOT_FOUND -> snack("Board not found — is it powered and in range?", retry = true)
@@ -291,7 +262,6 @@ class GarageViewModel(app: Application) :
     }
 
     override fun onWriteIssued() {
-        triggerInFlight = true
         _uiState.value = UiState.Triggering
     }
 
@@ -301,11 +271,6 @@ class GarageViewModel(app: Application) :
         cooldownJob?.cancel()
         cooldownJob = viewModelScope.launch {
             delay(COOLDOWN_MS)
-            triggerInFlight = false
-            if (!_firstPressHintSeen.value) {
-                AppPrefs.setFirstPressHintSeen(appContext, true)
-                _firstPressHintSeen.value = true
-            }
             // A successful trigger is the user acting: stale guidance clears.
             lastSecurityError = null
             if (_uiState.value is UiState.Cooldown) _uiState.value = UiState.Ready(null)
@@ -314,7 +279,7 @@ class GarageViewModel(app: Application) :
     }
 
     override fun onWriteFailed(status: Int, insufficientAuth: Boolean) {
-        clearTriggerFlag()
+        cooldownJob?.cancel()
         if (insufficientAuth) {
             // Stale bond after a board reset (§3).
             lastSecurityError = ErrorInfo(ErrorCause.STALE_BOND)
@@ -330,25 +295,13 @@ class GarageViewModel(app: Application) :
 
     override fun onDisconnected(clientInitiated: Boolean) {
         val state = _uiState.value
+        cooldownJob?.cancel()
         if (clientInitiated) {
-            // Exclusion list (§3): never raises the wrong-PIN chip.
-            clearTriggerFlag()
             setIdle(null)
             return
         }
-        // Wrong-PIN detector: an unexpected disconnect is what ended
-        // TRIGGERING/COOLDOWN with the flag set (§3, both orderings).
-        if ((state is UiState.Triggering || state is UiState.Cooldown) && triggerInFlight) {
-            clearTriggerFlag()
-            lastSecurityError = ErrorInfo(ErrorCause.WRONG_PIN_SUSPECTED)
-            setIdle(lastSecurityError)
-            snack("Board rejected the PIN — it may have been provisioned with a different one")
-            maybeRunPendingTeardown()
-            return
-        }
-        clearTriggerFlag()
         // One bounded silent reconnect on a mid-session drop from READY (§4).
-        if (state is UiState.Ready && started && !midSessionRetryUsed && preconditionsOk()) {
+        if (state is UiState.Ready && started && !midSessionRetryUsed && hasPermissions(appContext)) {
             midSessionRetryUsed = true
             setIdle(null)
             client.connect(directOnly = true)
@@ -361,7 +314,7 @@ class GarageViewModel(app: Application) :
 
     override fun onAdapterOn() {
         if (started && _uiState.value is UiState.Idle) {
-            if (preconditionsOk()) client.connect() else surfaceMissingPermission()
+            if (hasPermissions(appContext)) client.connect() else surfaceMissingPermission()
         }
     }
 
@@ -370,17 +323,12 @@ class GarageViewModel(app: Application) :
      * UI, not a mute "Disconnected" chip (§4).
      */
     private fun surfaceMissingPermission() {
-        if (_pinSet.value && !hasPermissions(appContext) && _uiState.value is UiState.Idle) {
+        if (!hasPermissions(appContext) && _uiState.value is UiState.Idle) {
             setIdle(ErrorInfo(ErrorCause.PERMISSION_MISSING))
         }
     }
 
     // --------------------------------------------------------------- helpers
-
-    private fun clearTriggerFlag() {
-        triggerInFlight = false
-        cooldownJob?.cancel()
-    }
 
     /**
      * The incoming cause is always the primary payload; persisted security

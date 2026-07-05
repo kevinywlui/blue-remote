@@ -1,13 +1,18 @@
 # Garage Remote app — UX improvement proposal
 
-Status: REVISED after panel review round 3. Reviewers: read README.md (user
-flows, security model) and the current app sources in
+Status: REVISED after panel review round 3; since then the **PIN layer has
+been removed** — the single BLE bond is now the only credential, so every
+reference in this document to a PIN or a stored secret (PIN entry, Change
+PIN, provisioning, the first-press hint, wrong-PIN detection, PIN-gated
+connect preconditions) is historical and no longer in the code. The connection-flow, theming, and accessibility decisions still
+apply. Reviewers: read README.md (user flows, security model) and the
+current app sources in
 `android/app/src/main/java/com/kevinywlui/garageremote/`
-(MainActivity.kt, GarageBleClient.kt, PinStore.kt) before judging.
+(MainActivity.kt, GarageBleClient.kt) before judging.
 
 Constraints:
 - Single-purpose app: connect to one BLE garage board, press one button.
-- Security flows (PIN, TOFU provisioning, single bond) are fixed; UX may
+- Security flows (TOFU single bond) are fixed; UX may
   present them better but not change the protocol.
 - Kotlin + Jetpack Compose, Material 3, minSdk 26. No new libraries
   unless strongly justified.
