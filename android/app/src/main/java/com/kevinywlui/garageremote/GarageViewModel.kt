@@ -1,0 +1,400 @@
+package com.kevinywlui.garageremote
+
+import android.Manifest
+import android.app.Application
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.viewModelScope
+import com.kevinywlui.garageremote.ui.theme.AppTheme
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.launch
+
+data class ErrorInfo(val cause: ErrorCause) {
+    val securityRelevant: Boolean
+        get() = cause == ErrorCause.WRONG_PIN_SUSPECTED ||
+            cause == ErrorCause.STALE_BOND ||
+            cause == ErrorCause.PAIRING_REJECTED
+}
+
+/** Errors are IDLE plus a payload (plan §3) — never message-string sniffing. */
+sealed interface UiState {
+    /**
+     * [error] is the current, actionable cause (chip label + button routing
+     * key off it); [securityDetail] is persisted security guidance shown on
+     * the detail line — it must never displace a newer actionable cause.
+     */
+    data class Idle(
+        val error: ErrorInfo? = null,
+        val securityDetail: ErrorInfo? = null,
+    ) : UiState
+    data object Scanning : UiState
+    data object Connecting : UiState
+    data object Bonding : UiState
+    data class Ready(val securityDetail: ErrorInfo? = null) : UiState
+    data object Triggering : UiState
+    data object Cooldown : UiState
+}
+
+data class SnackEvent(val message: String, val retry: Boolean = false)
+
+class GarageViewModel(app: Application) :
+    AndroidViewModel(app), DefaultLifecycleObserver, GarageBleClient.Listener {
+
+    companion object {
+        // Firmware cooldown is 2s; padded so our window never ends first (§3).
+        const val COOLDOWN_MS = 2200L
+        private const val GRACE_MS = 2500L
+        private const val TEARDOWN_HARD_CAP_MS = 35_000L
+        private const val SYSTEM_ACTIVITY_GUARD_TIMEOUT_MS = 60_000L
+
+        fun requiredPermissions(): Array<String> =
+            if (Build.VERSION.SDK_INT >= 31) {
+                arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+            } else {
+                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+            }
+
+        fun hasPermissions(context: Context): Boolean = requiredPermissions().all {
+            ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    private val appContext: Context get() = getApplication()
+    private val client = GarageBleClient(appContext, this)
+
+    // Read synchronously before setContent seeds this flow — no one-frame
+    // default-theme flash on cold start (§1).
+    private val _theme = MutableStateFlow(AppPrefs.theme(appContext))
+    val theme: StateFlow<AppTheme> = _theme.asStateFlow()
+
+    private val _uiState = MutableStateFlow<UiState>(UiState.Idle())
+    val uiState: StateFlow<UiState> = _uiState.asStateFlow()
+
+    private val _pinSet = MutableStateFlow(PinStore.isSet(appContext))
+    val pinSet: StateFlow<Boolean> = _pinSet.asStateFlow()
+
+    private val _firstPressHintSeen = MutableStateFlow(AppPrefs.firstPressHintSeen(appContext))
+    val firstPressHintSeen: StateFlow<Boolean> = _firstPressHintSeen.asStateFlow()
+
+    // One-shot events; a Channel buffers across recreation (plan §3).
+    private val snackChannel = Channel<SnackEvent>(
+        capacity = Channel.BUFFERED, onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    val snackbars: Flow<SnackEvent> = snackChannel.receiveAsFlow()
+
+    // Cleared on every exit from TRIGGERING/COOLDOWN; only an unexpected
+    // disconnect that itself ends those states fires the wrong-PIN detector.
+    private var triggerInFlight = false
+    private var cooldownJob: Job? = null
+
+    // Persisted security guidance; survives stop/start, shown as READY's
+    // detail line after reconnect until the user acts.
+    private var lastSecurityError: ErrorInfo? = null
+
+    private var started = false
+    private var graceJob: Job? = null
+    private var hardCapJob: Job? = null
+    private var teardownPending = false
+    private var systemActivityInFlight = false
+    private var systemActivityTimeoutJob: Job? = null
+    private var midSessionRetryUsed = false
+
+    // ------------------------------------------------------------ public API
+
+    fun setTheme(theme: AppTheme) {
+        _theme.value = theme
+        AppPrefs.setTheme(appContext, theme)
+    }
+
+    fun preconditionsOk(): Boolean =
+        _pinSet.value && hasPermissions(appContext)
+
+    /** User-initiated connect (button/chip retry). */
+    fun connect() {
+        if (!hasPermissions(appContext)) {
+            setIdle(ErrorInfo(ErrorCause.PERMISSION_MISSING))
+            return
+        }
+        if (!_pinSet.value) return
+        if (_uiState.value !is UiState.Idle) return
+        client.connect(userInitiated = true)
+    }
+
+    fun onPermissionsGranted() {
+        if (_uiState.value is UiState.Idle) {
+            // Leaving a PERMISSION_MISSING error behind.
+            setIdle(null)
+            client.connect(userInitiated = true)
+        }
+    }
+
+    /** [permanent] = denied with rationale suppressed ("don't ask again"). */
+    fun onPermissionsDenied(permanent: Boolean) {
+        setIdle(
+            ErrorInfo(
+                if (permanent) ErrorCause.PERMISSION_DENIED_PERMANENTLY
+                else ErrorCause.PERMISSION_MISSING,
+            ),
+        )
+    }
+
+    fun trigger() {
+        if (_uiState.value !is UiState.Ready) return
+        val secret = PinStore.get(appContext)
+        if (secret == null) {
+            snack("Set a PIN first")
+            return
+        }
+        client.trigger(secret)
+    }
+
+    fun savePin(pin: String) {
+        PinStore.set(appContext, pin)
+        _pinSet.value = true
+        lastSecurityError = null
+        // Post-factory-reset flow re-provisions on the next press, so the
+        // first-press hint is true again (§2).
+        AppPrefs.setFirstPressHintSeen(appContext, false)
+        _firstPressHintSeen.value = false
+    }
+
+    /** Set right before launching ACTION_REQUEST_ENABLE / settings deep links (§4). */
+    fun notifySystemActivityLaunched() {
+        systemActivityInFlight = true
+        systemActivityTimeoutJob?.cancel()
+        systemActivityTimeoutJob = viewModelScope.launch {
+            delay(SYSTEM_ACTIVITY_GUARD_TIMEOUT_MS)
+            systemActivityInFlight = false
+            maybeRunPendingTeardown()
+        }
+    }
+
+    fun notifySystemActivityResult() {
+        systemActivityInFlight = false
+        systemActivityTimeoutJob?.cancel()
+        maybeRunPendingTeardown()
+        if (started && preconditionsOk() && _uiState.value is UiState.Idle) {
+            client.connect()
+        }
+    }
+
+    // ------------------------------------------------------------- lifecycle
+
+    override fun onStart(owner: LifecycleOwner) {
+        started = true
+        graceJob?.cancel()
+        hardCapJob?.cancel() // a cap armed in the background must not fire post-return
+        teardownPending = false
+        if (preconditionsOk() && _uiState.value is UiState.Idle) {
+            client.connect()
+        } else {
+            surfaceMissingPermission()
+        }
+    }
+
+    override fun onStop(owner: LifecycleOwner) {
+        started = false
+        graceJob?.cancel()
+        graceJob = viewModelScope.launch {
+            delay(GRACE_MS)
+            evaluateTeardown()
+        }
+    }
+
+    override fun onCleared() {
+        // Terminal: no UI left for the TOFU flow; a held GATT occupies the
+        // board's single connection slot. No guards apply (§4). close()
+        // also releases the client's lifetime adapter receiver.
+        client.close()
+    }
+
+    private fun evaluateTeardown() {
+        if (started) return
+        val state = _uiState.value
+        val blocked = client.phase == GarageBleClient.Phase.BONDING ||
+            state is UiState.Triggering || systemActivityInFlight
+        if (blocked) {
+            teardownPending = true
+            hardCapJob?.cancel()
+            hardCapJob = viewModelScope.launch {
+                delay(TEARDOWN_HARD_CAP_MS)
+                doTeardown()
+            }
+        } else {
+            doTeardown()
+        }
+    }
+
+    private fun maybeRunPendingTeardown() {
+        if (teardownPending && !started) doTeardown()
+    }
+
+    private fun doTeardown() {
+        if (started) return
+        teardownPending = false
+        hardCapJob?.cancel()
+        client.disconnect()
+    }
+
+    // ------------------------------------------------------- client events
+
+    override fun onScanStarted() {
+        _uiState.value = UiState.Scanning
+    }
+
+    override fun onConnecting() {
+        _uiState.value = UiState.Connecting
+    }
+
+    override fun onBonding() {
+        _uiState.value = UiState.Bonding
+    }
+
+    override fun onReady(newlyBonded: Boolean) {
+        if (newlyBonded) lastSecurityError = null // user re-paired: acted
+        midSessionRetryUsed = false
+        _uiState.value = UiState.Ready(lastSecurityError)
+        maybeRunPendingTeardown()
+    }
+
+    override fun onFailed(cause: ErrorCause) {
+        clearTriggerFlag()
+        setIdle(ErrorInfo(cause))
+        when (cause) {
+            ErrorCause.NOT_FOUND -> snack("Board not found — is it powered and in range?", retry = true)
+            ErrorCause.SCAN_FAILED -> snack("Bluetooth scan failed", retry = true)
+            ErrorCause.PAIRING_REJECTED ->
+                snack("Pairing failed — another phone may own the board")
+            ErrorCause.STALE_BOND ->
+                snack("Connection keeps failing — remove the old pairing in Bluetooth settings")
+            ErrorCause.NO_TRIGGER_CHAR -> snack("Unexpected device — wrong board?")
+            else -> Unit // BLUETOOTH_OFF / LOCATION_OFF / PERMISSION render inline
+        }
+        maybeRunPendingTeardown()
+    }
+
+    override fun onStaleBondCleared() {
+        snack("Pairing was removed — setting up again")
+    }
+
+    override fun onWriteIssued() {
+        triggerInFlight = true
+        _uiState.value = UiState.Triggering
+    }
+
+    override fun onWriteSuccess() {
+        if (_uiState.value !is UiState.Triggering) return
+        _uiState.value = UiState.Cooldown
+        cooldownJob?.cancel()
+        cooldownJob = viewModelScope.launch {
+            delay(COOLDOWN_MS)
+            triggerInFlight = false
+            if (!_firstPressHintSeen.value) {
+                AppPrefs.setFirstPressHintSeen(appContext, true)
+                _firstPressHintSeen.value = true
+            }
+            // A successful trigger is the user acting: stale guidance clears.
+            lastSecurityError = null
+            if (_uiState.value is UiState.Cooldown) _uiState.value = UiState.Ready(null)
+        }
+        maybeRunPendingTeardown() // COOLDOWN is an explicitly safe teardown state
+    }
+
+    override fun onWriteFailed(status: Int, insufficientAuth: Boolean) {
+        clearTriggerFlag()
+        if (insufficientAuth) {
+            // Stale bond after a board reset (§3).
+            lastSecurityError = ErrorInfo(ErrorCause.STALE_BOND)
+            snack("Board refused the write — remove the old pairing in Bluetooth settings")
+        } else {
+            snack("Sending failed — try again", retry = false)
+        }
+        if (_uiState.value is UiState.Triggering) {
+            _uiState.value = UiState.Ready(lastSecurityError)
+        }
+        maybeRunPendingTeardown() // a failed write also resolves TRIGGERING (§4)
+    }
+
+    override fun onDisconnected(clientInitiated: Boolean) {
+        val state = _uiState.value
+        if (clientInitiated) {
+            // Exclusion list (§3): never raises the wrong-PIN chip.
+            clearTriggerFlag()
+            setIdle(null)
+            return
+        }
+        // Wrong-PIN detector: an unexpected disconnect is what ended
+        // TRIGGERING/COOLDOWN with the flag set (§3, both orderings).
+        if ((state is UiState.Triggering || state is UiState.Cooldown) && triggerInFlight) {
+            clearTriggerFlag()
+            lastSecurityError = ErrorInfo(ErrorCause.WRONG_PIN_SUSPECTED)
+            setIdle(lastSecurityError)
+            snack("Board rejected the PIN — it may have been provisioned with a different one")
+            maybeRunPendingTeardown()
+            return
+        }
+        clearTriggerFlag()
+        // One bounded silent reconnect on a mid-session drop from READY (§4).
+        if (state is UiState.Ready && started && !midSessionRetryUsed && preconditionsOk()) {
+            midSessionRetryUsed = true
+            setIdle(null)
+            client.connect(directOnly = true)
+            maybeRunPendingTeardown()
+            return
+        }
+        setIdle(ErrorInfo(ErrorCause.LINK_LOST))
+        maybeRunPendingTeardown()
+    }
+
+    override fun onAdapterOn() {
+        if (started && _uiState.value is UiState.Idle) {
+            if (preconditionsOk()) client.connect() else surfaceMissingPermission()
+        }
+    }
+
+    /**
+     * A start with revoked permissions must land on the permission recovery
+     * UI, not a mute "Disconnected" chip (§4).
+     */
+    private fun surfaceMissingPermission() {
+        if (_pinSet.value && !hasPermissions(appContext) && _uiState.value is UiState.Idle) {
+            setIdle(ErrorInfo(ErrorCause.PERMISSION_MISSING))
+        }
+    }
+
+    // --------------------------------------------------------------- helpers
+
+    private fun clearTriggerFlag() {
+        triggerInFlight = false
+        cooldownJob?.cancel()
+    }
+
+    /**
+     * The incoming cause is always the primary payload; persisted security
+     * guidance rides along as the detail line (§3) — surviving null-payload
+     * teardowns without ever masking a newer actionable error.
+     */
+    private fun setIdle(error: ErrorInfo?) {
+        if (error != null && error.securityRelevant) lastSecurityError = error
+        val primary = error ?: lastSecurityError
+        val detail = lastSecurityError?.takeIf { it != primary }
+        _uiState.value = UiState.Idle(primary, detail)
+    }
+
+    private fun snack(message: String, retry: Boolean = false) {
+        snackChannel.trySend(SnackEvent(message, retry))
+    }
+}

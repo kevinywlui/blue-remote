@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Pre-Compose window background follows system darkness (values-night
+         overrides) so dark-theme users get no white flash on cold start. -->
+    <style name="Theme.GarageRemote" parent="@android:style/Theme.Material.Light.NoActionBar" />
+</resources>

@@ -1,0 +1,8 @@
+# PlatformIO
+firmware/.pio/
+
+# Editor/OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
