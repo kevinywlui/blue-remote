@@ -15,10 +15,9 @@ blue-remote/
 **First-time setup**
 1. Flash the board and power it near the phone.
 2. Install the app; grant Bluetooth permissions on first launch.
-3. Choose a PIN and save it (6+ digits recommended).
-4. The app scans and connects; confirm Android's pairing dialog.
-5. Press the big button — the first press provisions the PIN into the
-   board and pulses the door.
+3. The app scans and connects; confirm Android's pairing dialog. Your
+   phone is now the only device that can ever pair with the board.
+4. Press the big button — the door triggers.
 
 **Daily use**
 1. Open the app; it auto-connects to the bonded board.
@@ -29,18 +28,13 @@ blue-remote/
 - If the board is off or out of range, the scan times out after 15s and
   shows a status message; tap Connect to retry.
 
-**Change PIN**
-- Main screen → Change PIN. Only meaningful for an unprovisioned (or
-  factory-reset) board — a provisioned board answers only to the PIN it
-  was provisioned with.
-
 **Switch phones / factory reset**
-1. Erase and re-flash the board over USB (`pio run -t erase`, then
-   `pio run -t upload` in `firmware/`) — this wipes the bond and stored
-   secret.
+1. Hold the board's reset button ~3s (or erase and re-flash over USB:
+   `pio run -t erase`, then `pio run -t upload` in `firmware/`) — this
+   wipes the bond.
 2. Remove the pairing from the old phone's Bluetooth settings.
-3. On the new phone: install the app, enter the same (or a new) PIN,
-   connect, and press.
+3. On the new phone: install the app and connect — it becomes the new
+   owner.
 
 ## Wiring
 
@@ -66,21 +60,23 @@ low first thing at boot. The onboard yellow LED lights during the pulse.
 
 ## Security model
 
-Trust on first use — the first phone to connect becomes the owner:
+Trust on first use — the first phone to pair becomes the owner, and the
+bond IS the credential:
 
-1. **Single bonded, encrypted link** — "Just Works" BLE pairing (no PIN).
-   The firmware accepts exactly **one** bonded device; pairing attempts
-   from any other device are rejected and their bonds deleted. The trigger
-   characteristic rejects writes on unencrypted links.
-2. **PIN-derived secret** — on first launch the app asks you to choose a
-   PIN and derives a 16-byte secret from it (SHA-256, truncated). The
-   firmware stores the first secret it ever receives in flash; from then
-   on every write must match it or the connection is dropped.
+- **Single bonded, encrypted link** — "Just Works" BLE pairing (no PIN).
+  The firmware accepts exactly **one** bonded device; pairing attempts
+  from any other device are rejected and their bonds deleted. The trigger
+  characteristic rejects writes on unencrypted links, so only the bonded
+  phone can trigger the door.
+- **Persistence** — the bond keys live in the board's flash (NimBLE/NVS)
+  and in Android's Bluetooth stack, so ownership survives reboots and
+  power loss on both ends. The app also remembers the board's MAC for a
+  fast direct reconnect on launch.
 
 The trade-off vs. passkey pairing: there is no MITM protection during the
-very first pairing, and whoever connects first owns the device. Do the
-first connection at home with the board freshly powered, and both windows
-close permanently.
+very first pairing, and whoever pairs first owns the device. Do the first
+connection at home with the board freshly powered, and the window closes
+permanently.
 
 ### Switching phones / factory reset
 
@@ -88,22 +84,17 @@ Erase and re-flash the board over USB:
 
 ```sh
 cd firmware
-pio run -t erase     # wipes the bond and the stored secret
+pio run -t erase     # wipes the bond
 pio run -t upload    # re-flash the firmware
 ```
 
-On the new phone, enter the **same PIN** (or a new one — the board is
-fresh either way) and connect; it becomes the new owner. Also remove the
-old pairing from the previous phone's Bluetooth settings.
+Then remove the old pairing from the previous phone's Bluetooth settings
+and connect from the new phone; it becomes the new owner.
 
 (Optional, no computer needed: wire a momentary button from GPIO9 to GND
 — holding it ~3s while the board runs does the same reset, confirmed by
 the LED blinking. The firmware supports this out of the box; the pin is
 simply unused if no button is fitted.)
-
-Changing the PIN in the app ("Change PIN") only helps *before* the board
-is provisioned — after that, the board expects the original PIN, so a PIN
-change must be paired with a factory reset of the board.
 
 ## Firmware: build & flash
 
@@ -128,13 +119,10 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 ## First-time pairing
 
 1. Power the XIAO.
-2. Open the app, grant the Bluetooth permissions, and choose a PIN
-   (6+ digits recommended) when prompted.
+2. Open the app and grant the Bluetooth permissions when prompted.
 3. The app scans, connects, and starts pairing; confirm Android's pairing
    dialog. Your phone is now the only device that can bond.
-4. Status becomes "Paired and connected" — the big button is live. The
-   first press provisions your PIN's secret into the firmware (and opens
-   the door).
+4. Status becomes "Connected" — the big button is live.
 
 Afterwards it reconnects automatically on app launch.
 
@@ -142,7 +130,7 @@ Afterwards it reconnects automatically on app launch.
 
 BLE service `4090b92d-a8da-471a-85a8-aee612b68bad`, characteristic
 `588a322e-4b88-4197-8f4e-a5f48417c8b7` (write, encrypted bonded link
-required). Write a 16-byte secret (the app uses the first 16 bytes of
-SHA-256 over the PIN string): the first one ever received is stored as
-THE secret and honored; afterwards, any write that doesn't match it
-disconnects you.
+required). Any write on the encrypted bonded link pulses the door (the
+app writes a single `0x01` byte); the bond itself is the credential, so
+writes from anything but the one bonded phone are impossible at the link
+layer.

@@ -3,7 +3,6 @@ package com.kevinywlui.garageremote.ui
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -11,7 +10,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -23,7 +21,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -52,7 +49,6 @@ private val DarkThemes = listOf(AppTheme.MIDNIGHT, AppTheme.EMBER, AppTheme.FORE
 fun SettingsSheet(
     currentTheme: AppTheme,
     onThemeSelected: (AppTheme) -> Unit,
-    onChangePin: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
@@ -95,37 +91,21 @@ fun SettingsSheet(
 
             HorizontalDivider(Modifier.padding(vertical = 8.dp))
 
-            // 48dp row target.
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 48.dp)
-                    .clickable(role = Role.Button, onClickLabel = "Change PIN", onClick = onChangePin),
-            ) {
-                Icon(Icons.Filled.Edit, contentDescription = null)
-                Spacer(Modifier.width(16.dp))
-                Text("Change PIN", style = MaterialTheme.typography.bodyLarge)
-            }
-
-            HorizontalDivider(Modifier.padding(vertical = 8.dp))
-
             Text("How pairing works", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
             Text(
-                text = "The board trusts the first phone that connects: do the first " +
-                    "connection at home with the board freshly powered — whoever connects " +
-                    "first owns it, and that first pairing has no protection against an " +
-                    "active interceptor.\n\n" +
-                    "Saving a PIN here doesn't program the board; your first button press " +
-                    "does. The board then answers only to that PIN.\n\n" +
-                    "To switch phones or change the PIN on the board: factory-reset it by " +
-                    "erasing and re-flashing the firmware over USB (see the project " +
-                    "README), and remove the old pairing in your phone's Bluetooth " +
-                    "settings — reconnects fail until the stale pairing is removed.\n\n" +
-                    "The PIN is stored as a hash that a leaked copy could brute-force " +
-                    "quickly, so 6+ digits are recommended — and don't reuse a PIN from " +
-                    "anywhere else.",
+                text = "The board pairs with exactly one phone — the first one to " +
+                    "connect owns it, permanently. Do the first connection at home " +
+                    "with the board freshly powered; that first pairing has no " +
+                    "protection against an active interceptor, but once it's made, " +
+                    "no other phone can ever pair.\n\n" +
+                    "The pairing is remembered on both ends, so the app reconnects " +
+                    "automatically — no PIN or password involved.\n\n" +
+                    "To switch phones: factory-reset the board (hold its reset " +
+                    "button ~3s, or erase and re-flash the firmware over USB — see " +
+                    "the project README), and remove the old pairing in the old " +
+                    "phone's Bluetooth settings. The next phone to connect becomes " +
+                    "the new owner.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

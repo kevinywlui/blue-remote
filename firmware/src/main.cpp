@@ -1,26 +1,23 @@
 // Garage remote trigger — Seeed XIAO ESP32-C6.
 //
-// BLE GATT server with one writable characteristic. A write containing the
-// stored 16-byte secret pulses TRIGGER_PIN, which drives the optocoupler
+// BLE GATT server with one writable characteristic. Any write on the
+// encrypted bonded link pulses TRIGGER_PIN, which drives the optocoupler
 // LED that "presses" the garage remote's button.
 //
-// Security model (see README):
-//   1. Link layer: encrypted bonded connection ("Just Works" pairing).
-//      Exactly ONE device may bond; pairing attempts from any other device
-//      are rejected and their bonds deleted.
-//   2. Application layer: trust-on-first-use secret. The first 16-byte
-//      write from the bonded phone is stored in flash; from then on every
-//      write must match it or the connection is dropped.
+// Security model (see README): the encrypted bond IS the credential.
+//   "Just Works" pairing, and exactly ONE device may ever bond — the first
+//   phone to pair becomes the owner; pairing attempts from any other device
+//   are rejected and their bonds deleted. NimBLE persists the bond keys in
+//   NVS, so ownership survives power loss on both ends.
 //
 // Factory reset (new phone): erase and re-flash over USB —
-// `pio run -t erase` then `pio run -t upload` — which wipes the bond and
-// the stored secret; the next device to connect becomes the owner.
-// Optionally, a momentary button wired from GPIO9 to GND (not populated
-// on all boards) held ~3s at runtime does the same without a computer.
+// `pio run -t erase` then `pio run -t upload` — which wipes the bond;
+// the next device to pair becomes the owner. Optionally, a momentary
+// button wired from GPIO9 to GND (not populated on all boards) held ~3s
+// at runtime does the same without a computer.
 
 #include <Arduino.h>
 #include <NimBLEDevice.h>
-#include <Preferences.h>
 
 static const char* DEVICE_NAME = "GarageRemote";
 static const char* SERVICE_UUID = "4090b92d-a8da-471a-85a8-aee612b68bad";
@@ -33,13 +30,8 @@ static const uint8_t RESET_BUTTON_PIN = 9;
 static const uint32_t PULSE_MS = 400;         // how long the "button" is held
 static const uint32_t COOLDOWN_MS = 2000;     // min gap between pulses
 static const uint32_t RESET_HOLD_MS = 3000;
-static const size_t SECRET_LEN = 16;
 
 static NimBLEServer* server = nullptr;
-static Preferences prefs;
-
-static uint8_t storedSecret[SECRET_LEN];
-static bool provisioned = false;
 
 // Set from the BLE callback, consumed in loop() so the radio task never
 // blocks on the 400ms pulse.
@@ -58,10 +50,8 @@ static bool isKnownBond(const NimBLEAddress& addr) {
 }
 
 static void factoryReset() {
-    Serial.println("Factory reset: erasing bond and stored secret");
+    Serial.println("Factory reset: erasing bond");
     NimBLEDevice::deleteAllBonds();
-    prefs.clear();
-    provisioned = false;
     knownBonds.clear();
     for (int i = 0; i < 6; i++) {  // acknowledge with a blink
         digitalWrite(LED_BUILTIN, LOW);
@@ -109,27 +99,13 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 };
 
 class TriggerCallbacks : public NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic* chr, NimBLEConnInfo& connInfo) override {
-        NimBLEAttValue value = chr->getValue();
-        if (value.size() != SECRET_LEN) {
-            Serial.println("Write with bad length; dropping");
-            server->disconnect(connInfo.getConnHandle());
-            return;
-        }
-
-        if (!provisioned) {
-            // Trust on first use: the first secret we see becomes THE secret.
-            memcpy(storedSecret, value.data(), SECRET_LEN);
-            prefs.putBytes("secret", storedSecret, SECRET_LEN);
-            provisioned = true;
-            Serial.println("Provisioned secret from first write");
-            triggerRequested = true;  // the owner pressed the button; honor it
-            return;
-        }
-
-        if (memcmp(value.data(), storedSecret, SECRET_LEN) != 0) {
-            Serial.printf("Write with wrong secret from %s; dropping\n",
-                          connInfo.getAddress().toString().c_str());
+    void onWrite(NimBLECharacteristic*, NimBLEConnInfo& connInfo) override {
+        // WRITE_ENC already gates this at the ATT layer, and only the owner
+        // can ever hold a bond; re-check anyway so a stack quirk can't turn
+        // an unencrypted write into a door pulse.
+        if (!connInfo.isEncrypted() || !connInfo.isBonded() ||
+            !isKnownBond(connInfo.getIdAddress())) {
+            Serial.println("Write on unauthorized link; dropping");
             server->disconnect(connInfo.getConnHandle());
             return;
         }
@@ -147,12 +123,6 @@ void setup() {
     pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
 
     Serial.begin(115200);
-
-    prefs.begin("garage", false);
-    provisioned = prefs.getBytesLength("secret") == SECRET_LEN;
-    if (provisioned) {
-        prefs.getBytes("secret", storedSecret, SECRET_LEN);
-    }
 
     NimBLEDevice::init(DEVICE_NAME);
     // Just Works pairing: bonding + LE Secure Connections, no passkey.
@@ -180,8 +150,8 @@ void setup() {
     adv->setName(DEVICE_NAME);
     adv->start();
 
-    Serial.printf("Advertising as %s; bonds=%d provisioned=%s\n", DEVICE_NAME,
-                  (int)knownBonds.size(), provisioned ? "yes" : "no");
+    Serial.printf("Advertising as %s; bonds=%d\n", DEVICE_NAME,
+                  (int)knownBonds.size());
 }
 
 // Millis timestamp when the optional reset button was first seen held;
