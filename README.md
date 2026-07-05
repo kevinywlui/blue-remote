@@ -16,7 +16,8 @@ blue-remote/
 1. Flash the board and power it near the phone.
 2. Install the app; grant Bluetooth permissions on first launch.
 3. The app scans and connects; confirm Android's pairing dialog. Your
-   phone is now the only device that can ever pair with the board.
+   phone is now the only device that can pair with the board (until a
+   factory reset).
 4. Press the big button — the door triggers.
 
 **Daily use**
@@ -26,7 +27,7 @@ blue-remote/
 
 **Reconnecting**
 - If the board is off or out of range, the scan times out after 15s and
-  shows a status message; tap Connect to retry.
+  shows a status message; tap Reconnect to retry.
 
 **Switch phones / factory reset**
 1. Hold the board's BOOT button ~3s while it's running — the LED blinks

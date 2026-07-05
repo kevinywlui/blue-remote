@@ -95,10 +95,10 @@ fun SettingsSheet(
             Spacer(Modifier.height(8.dp))
             Text(
                 text = "The board pairs with exactly one phone — the first one to " +
-                    "connect owns it, permanently. Do the first connection at home " +
-                    "with the board freshly powered; that first pairing has no " +
-                    "protection against an active interceptor, but once it's made, " +
-                    "no other phone can ever pair.\n\n" +
+                    "connect owns it until a factory reset. Do the first connection " +
+                    "at home with the board freshly powered; that first pairing has " +
+                    "no protection against an active interceptor, but once it's " +
+                    "made, no other phone can pair.\n\n" +
                     "The pairing is remembered on both ends, so the app reconnects " +
                     "automatically — no PIN or password involved.\n\n" +
                     "To switch phones: factory-reset the board — hold its BOOT " +

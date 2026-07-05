@@ -2,9 +2,9 @@
 
 Status: REVISED after panel review round 3; since then the **PIN layer has
 been removed** — the single BLE bond is now the only credential, so every
-reference in this document to PIN entry, Change PIN, provisioning, the
-first-press hint, or wrong-PIN detection is historical and no longer in
-the code. The connection-flow, theming, and accessibility decisions still
+reference in this document to a PIN or a stored secret (PIN entry, Change
+PIN, provisioning, the first-press hint, wrong-PIN detection, PIN-gated
+connect preconditions) is historical and no longer in the code. The connection-flow, theming, and accessibility decisions still
 apply. Reviewers: read README.md (user flows, security model) and the
 current app sources in
 `android/app/src/main/java/com/kevinywlui/garageremote/`
