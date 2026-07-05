@@ -10,11 +10,10 @@
 //   are rejected and their bonds deleted. NimBLE persists the bond keys in
 //   NVS, so ownership survives power loss on both ends.
 //
-// Factory reset (new phone): erase and re-flash over USB —
-// `pio run -t erase` then `pio run -t upload` — which wipes the bond;
-// the next device to pair becomes the owner. Optionally, a momentary
-// button wired from GPIO9 to GND (not populated on all boards) held ~3s
-// at runtime does the same without a computer.
+// Factory reset (new phone): hold the XIAO's onboard BOOT button ~3s
+// while the board runs (the LED blinks to confirm), or erase and
+// re-flash over USB — `pio run -t erase` then `pio run -t upload`.
+// Either wipes the bond; the next device to pair becomes the owner.
 
 #include <Arduino.h>
 #include <NimBLEDevice.h>
@@ -24,8 +23,9 @@ static const char* SERVICE_UUID = "4090b92d-a8da-471a-85a8-aee612b68bad";
 static const char* TRIGGER_CHAR_UUID = "588a322e-4b88-4197-8f4e-a5f48417c8b7";
 
 static const uint8_t TRIGGER_PIN = D0;
-// Optional factory-reset button (GPIO9 to GND, active low). Harmless when
-// absent: INPUT_PULLUP keeps the pin high.
+// Factory-reset button: the XIAO's onboard BOOT button (GPIO9 to GND,
+// active low). Held ~3s at runtime it wipes the bond — not to be confused
+// with the RST button next to it, which just reboots.
 static const uint8_t RESET_BUTTON_PIN = 9;
 static const uint32_t PULSE_MS = 400;         // how long the "button" is held
 static const uint32_t COOLDOWN_MS = 2000;     // min gap between pulses
@@ -154,8 +154,7 @@ void setup() {
                   (int)knownBonds.size());
 }
 
-// Millis timestamp when the optional reset button was first seen held;
-// 0 = not held.
+// Millis timestamp when the BOOT button was first seen held; 0 = not held.
 static uint32_t buttonHeldSince = 0;
 
 void loop() {

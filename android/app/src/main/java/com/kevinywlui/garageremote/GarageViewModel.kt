@@ -109,8 +109,6 @@ class GarageViewModel(app: Application) :
         AppPrefs.setTheme(appContext, theme)
     }
 
-    fun preconditionsOk(): Boolean = hasPermissions(appContext)
-
     /** User-initiated connect (button/chip retry). */
     fun connect() {
         if (!hasPermissions(appContext)) {
@@ -159,7 +157,7 @@ class GarageViewModel(app: Application) :
         systemActivityInFlight = false
         systemActivityTimeoutJob?.cancel()
         maybeRunPendingTeardown()
-        if (started && preconditionsOk() && _uiState.value is UiState.Idle) {
+        if (started && hasPermissions(appContext) && _uiState.value is UiState.Idle) {
             client.connect()
         }
     }
@@ -171,7 +169,7 @@ class GarageViewModel(app: Application) :
         graceJob?.cancel()
         hardCapJob?.cancel() // a cap armed in the background must not fire post-return
         teardownPending = false
-        if (preconditionsOk() && _uiState.value is UiState.Idle) {
+        if (hasPermissions(appContext) && _uiState.value is UiState.Idle) {
             client.connect()
         } else {
             surfaceMissingPermission()
@@ -188,7 +186,7 @@ class GarageViewModel(app: Application) :
     }
 
     override fun onCleared() {
-        // Terminal: no UI left for the TOFU flow; a held GATT occupies the
+        // Terminal: no UI left for the bonding flow; a held GATT occupies the
         // board's single connection slot. No guards apply (§4). close()
         // also releases the client's lifetime adapter receiver.
         client.close()
@@ -303,7 +301,7 @@ class GarageViewModel(app: Application) :
             return
         }
         // One bounded silent reconnect on a mid-session drop from READY (§4).
-        if (state is UiState.Ready && started && !midSessionRetryUsed && preconditionsOk()) {
+        if (state is UiState.Ready && started && !midSessionRetryUsed && hasPermissions(appContext)) {
             midSessionRetryUsed = true
             setIdle(null)
             client.connect(directOnly = true)
@@ -316,7 +314,7 @@ class GarageViewModel(app: Application) :
 
     override fun onAdapterOn() {
         if (started && _uiState.value is UiState.Idle) {
-            if (preconditionsOk()) client.connect() else surfaceMissingPermission()
+            if (hasPermissions(appContext)) client.connect() else surfaceMissingPermission()
         }
     }
 

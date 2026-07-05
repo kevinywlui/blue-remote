@@ -29,9 +29,10 @@ blue-remote/
   shows a status message; tap Connect to retry.
 
 **Switch phones / factory reset**
-1. Hold the board's reset button ~3s (or erase and re-flash over USB:
-   `pio run -t erase`, then `pio run -t upload` in `firmware/`) — this
-   wipes the bond.
+1. Hold the board's BOOT button ~3s while it's running — the LED blinks
+   to confirm the bond is wiped. (Not the RST button, which just
+   reboots. USB alternative: `pio run -t erase`, then
+   `pio run -t upload` in `firmware/`.)
 2. Remove the pairing from the old phone's Bluetooth settings.
 3. On the new phone: install the app and connect — it becomes the new
    owner.
@@ -80,7 +81,12 @@ permanently.
 
 ### Switching phones / factory reset
 
-Erase and re-flash the board over USB:
+Hold the XIAO's onboard BOOT button (wired to GPIO9) for ~3s while the
+board is running; the LED blinks to confirm the bond is wiped. Don't
+confuse it with the RST button next to it — RST just reboots and leaves
+the bond intact.
+
+No-button alternative, over USB:
 
 ```sh
 cd firmware
@@ -90,11 +96,6 @@ pio run -t upload    # re-flash the firmware
 
 Then remove the old pairing from the previous phone's Bluetooth settings
 and connect from the new phone; it becomes the new owner.
-
-(Optional, no computer needed: wire a momentary button from GPIO9 to GND
-— holding it ~3s while the board runs does the same reset, confirmed by
-the LED blinking. The firmware supports this out of the box; the pin is
-simply unused if no button is fitted.)
 
 ## Firmware: build & flash
 

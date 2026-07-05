@@ -163,8 +163,7 @@ class GarageBleClient(
         val characteristic = triggerChar
         if (phase != Phase.CONNECTED || gatt == null || characteristic == null) return
         writeRetried = false
-        if (issueWrite(gatt, characteristic, TRIGGER_PAYLOAD)) {
-            writePending = true
+        if (issueWrite(gatt, characteristic)) {
             listener.onWriteIssued()
         } else {
             listener.onWriteFailed(-1, insufficientAuth = false)
@@ -180,8 +179,6 @@ class GarageBleClient(
 
     // ------------------------------------------------------------- internals
 
-    private var writePending = false
-
     private fun toIdle() {
         phase = Phase.IDLE
     }
@@ -196,7 +193,6 @@ class GarageBleClient(
         triggerChar = null
         device = null
         directAttempt = false
-        writePending = false
         toIdle()
     }
 
@@ -286,16 +282,15 @@ class GarageBleClient(
     private fun issueWrite(
         g: BluetoothGatt,
         characteristic: BluetoothGattCharacteristic,
-        secret: ByteArray,
     ): Boolean = if (Build.VERSION.SDK_INT >= 33) {
         g.writeCharacteristic(
-            characteristic, secret, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+            characteristic, TRIGGER_PAYLOAD, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
         ) == BluetoothGatt.GATT_SUCCESS
     } else {
         @Suppress("DEPRECATION")
         run {
             characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            characteristic.value = secret
+            characteristic.value = TRIGGER_PAYLOAD
             g.writeCharacteristic(characteristic)
         }
     }
@@ -356,10 +351,7 @@ class GarageBleClient(
                 val insufficient = status == GATT_INSUFFICIENT_AUTHENTICATION ||
                     status == GATT_INSUFFICIENT_ENCRYPTION
                 when {
-                    status == BluetoothGatt.GATT_SUCCESS -> {
-                        writePending = false
-                        listener.onWriteSuccess()
-                    }
+                    status == BluetoothGatt.GATT_SUCCESS -> listener.onWriteSuccess()
                     // One silent retry, only for the bond-complete-before-
                     // encryption race, only after the bond receiver observed
                     // BOND_BONDED this session (§3).
@@ -367,15 +359,10 @@ class GarageBleClient(
                         writeRetried = true
                         val chr = triggerChar
                         val cur = gatt
-                        if (writePending && chr != null && cur != null &&
-                            issueWrite(cur, chr, TRIGGER_PAYLOAD)
-                        ) return@post
+                        if (chr != null && cur != null && issueWrite(cur, chr)) return@post
                         listener.onWriteFailed(status, insufficientAuth = true)
                     }
-                    else -> {
-                        writePending = false
-                        listener.onWriteFailed(status, insufficientAuth = insufficient)
-                    }
+                    else -> listener.onWriteFailed(status, insufficientAuth = insufficient)
                 }
             }
         }
@@ -400,7 +387,6 @@ class GarageBleClient(
         unregisterBondReceiver()
         handler.removeCallbacks(directTimeout)
         directAttempt = false
-        writePending = false
         toIdle()
         if (!wasConnectingOrUp) return
 

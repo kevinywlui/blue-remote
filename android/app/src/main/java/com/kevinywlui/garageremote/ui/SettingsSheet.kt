@@ -101,11 +101,11 @@ fun SettingsSheet(
                     "no other phone can ever pair.\n\n" +
                     "The pairing is remembered on both ends, so the app reconnects " +
                     "automatically — no PIN or password involved.\n\n" +
-                    "To switch phones: factory-reset the board (hold its reset " +
-                    "button ~3s, or erase and re-flash the firmware over USB — see " +
-                    "the project README), and remove the old pairing in the old " +
-                    "phone's Bluetooth settings. The next phone to connect becomes " +
-                    "the new owner.",
+                    "To switch phones: factory-reset the board — hold its BOOT " +
+                    "button ~3 seconds while it's powered (the LED blinks to " +
+                    "confirm; the RST button next to it only reboots) — and remove " +
+                    "the old pairing in the old phone's Bluetooth settings. The " +
+                    "next phone to connect becomes the new owner.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
