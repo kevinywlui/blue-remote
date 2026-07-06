@@ -180,6 +180,7 @@ private fun chipErrorLabel(cause: ErrorCause): String = when (cause) {
     ErrorCause.SCAN_FAILED -> "Scan failed"
     ErrorCause.PAIRING_REJECTED -> "Pairing failed"
     ErrorCause.STALE_BOND -> "Pairing out of date"
+    ErrorCause.UNPAIRED_SELF -> "Access removed"
     ErrorCause.LINK_LOST -> "Connection lost"
     ErrorCause.NO_TRIGGER_CHAR -> "Unexpected device"
 }
@@ -276,8 +277,10 @@ private fun SecondaryDetail(state: UiState) {
 private fun detailText(cause: ErrorCause): String? = when (cause) {
     ErrorCause.STALE_BOND ->
         "Remove this device's old pairing in your phone's Bluetooth settings, then reconnect."
+    ErrorCause.UNPAIRED_SELF ->
+        "This phone was unpaired from the board. Also remove \"GarageRemote\" in your phone's Bluetooth settings. To pair again, open the pairing window from another paired phone — or factory-reset the board."
     ErrorCause.PAIRING_REJECTED ->
-        "The board only bonds to one phone. Factory-reset it (see \"How pairing works\" in Settings) to take ownership."
+        "Pairing is closed. Open it from an already-paired phone (Settings → Pair another phone) or short-press the board's BOOT button, then retry within 30 seconds."
     ErrorCause.NOT_FOUND -> "Make sure the board is powered and within range."
     ErrorCause.BLUETOOTH_OFF -> "Turn on Bluetooth to connect."
     ErrorCause.LOCATION_OFF -> "Android needs Location Services on for BLE scanning on this Android version."

@@ -1,46 +1,154 @@
 // Garage remote trigger — Seeed XIAO ESP32-C6.
 //
-// BLE GATT server with one writable characteristic. Any write on the
-// encrypted bonded link pulses TRIGGER_PIN, which drives the optocoupler
-// LED that "presses" the garage remote's button.
+// BLE GATT server with three characteristics:
+//   - trigger:   any write on an authorized link pulses TRIGGER_PIN, which
+//                drives the optocoupler LED that "presses" the garage
+//                remote's button.
+//   - management (write): opcode 0x01 opens a 30s pairing window;
+//                0x02 + 6-byte address + 1-byte type unpairs that phone;
+//                0x03 + up to 24 bytes of UTF-8 names the calling phone.
+//   - bond list (read): the current allowlist — per entry a 6-byte address
+//                (display order), address type, flags (bit0 = the reading
+//                phone itself), and the registered name.
 //
 // Security model (see README): the encrypted bond IS the credential.
-//   "Just Works" pairing, and exactly ONE device may ever bond — the first
-//   phone to pair becomes the owner; pairing attempts from any other device
-//   are rejected and their bonds deleted. NimBLE persists the bond keys in
-//   NVS, so ownership survives power loss on both ends.
+//   "Just Works" pairing; the board keeps an allowlist of up to MAX_BONDS
+//   phones. A new bond is accepted only while the pairing window is open
+//   (exception: a board with zero bonds accepts its first phone directly,
+//   so first-time setup needs no window). The window is opened by a short
+//   press of the onboard BOOT button or by a bonded phone writing 0x01 to
+//   the management characteristic; it closes after one successful bond or
+//   30 seconds. Outside the window, pairing attempts are rejected and
+//   their bonds deleted. Connections that never authenticate are dropped
+//   after UNAUTH_TIMEOUT_MS so strangers can't squat connection slots.
 //
-// Factory reset (new phone): hold the XIAO's onboard BOOT button ~3s
-// while the board runs (the LED blinks to confirm), or erase and
-// re-flash over USB — `pio run -t erase` then `pio run -t upload`.
-// Either wipes the bond; the next device to pair becomes the owner.
+// Factory reset (wipes ALL bonds and names): hold the BOOT button ~3s
+// while the board runs (the LED blinks to confirm), or erase and re-flash
+// over USB — `pio run -t erase` then `pio run -t upload`.
+//
+// LED legend: solid 400ms = trigger pulse; slow blink = pairing window
+// open; rapid blinking = factory reset; triple fast blink = pairing window
+// refused (allowlist full).
 
 #include <Arduino.h>
 #include <NimBLEDevice.h>
+#include <Preferences.h>
 
 static const char* DEVICE_NAME = "GarageRemote";
 static const char* SERVICE_UUID = "4090b92d-a8da-471a-85a8-aee612b68bad";
 static const char* TRIGGER_CHAR_UUID = "588a322e-4b88-4197-8f4e-a5f48417c8b7";
+static const char* MGMT_CHAR_UUID = "f34dd3a3-ed37-4822-9d08-f96ee2974856";
+static const char* BOND_LIST_CHAR_UUID = "8d3a66f6-42a0-4d0b-8a56-3a9f2f8e5c01";
 
 static const uint8_t TRIGGER_PIN = D0;
-// Factory-reset button: the XIAO's onboard BOOT button (GPIO9 to GND,
-// active low). Held ~3s at runtime it wipes the bond — not to be confused
-// with the RST button next to it, which just reboots.
+// Factory-reset / pairing button: the XIAO's onboard BOOT button (GPIO9 to
+// GND, active low). Short press = open the pairing window; held ~3s =
+// factory reset. Not to be confused with the RST button next to it, which
+// just reboots.
 static const uint8_t RESET_BUTTON_PIN = 9;
-static const uint32_t PULSE_MS = 400;         // how long the "button" is held
-static const uint32_t COOLDOWN_MS = 2000;     // min gap between pulses
+static const uint32_t PULSE_MS = 400;          // how long the "button" is held
+static const uint32_t COOLDOWN_MS = 2000;      // min gap between pulses
 static const uint32_t RESET_HOLD_MS = 3000;
+static const uint32_t BUTTON_DEBOUNCE_MS = 50; // short-press lower bound
+static const uint32_t PAIRING_WINDOW_MS = 30000;
+static const uint32_t UNAUTH_TIMEOUT_MS = 25000;
+// Must not exceed MYNEWT_VAL_BLE_STORE_MAX_BONDS (platformio.ini).
+static const size_t MAX_BONDS = 3;
+static const size_t MAX_CONNECTIONS = 3;  // == MYNEWT_VAL_BLE_MAX_CONNECTIONS
+static const size_t MAX_NAME_LEN = 24;
+
+// Management opcodes.
+static const uint8_t OP_OPEN_WINDOW = 0x01;
+static const uint8_t OP_UNPAIR = 0x02;
+static const uint8_t OP_SET_NAME = 0x03;
 
 static NimBLEServer* server = nullptr;
+static Preferences namesPrefs;  // identity-address hex -> registered name
 
-// Set from the BLE callback, consumed in loop() so the radio task never
-// blocks on the 400ms pulse.
+// Set from BLE callbacks, consumed in loop() so the radio task never blocks
+// on the 400ms pulse or on NVS writes.
 static volatile bool triggerRequested = false;
+static volatile bool pairWindowOpenRequested = false;
 static uint32_t lastPulseAt = 0;
 
-// Identity addresses of bonded peers. At most one entry; enforced in
-// onAuthenticationComplete.
+// Pairing window. Written by loop() (open/expiry) and by the host task
+// (close-on-first-bond in onAuthenticationComplete); read by both.
+// Single-byte stores are atomic here — same convention as triggerRequested.
+static volatile bool pairWindowOpen = false;
+static uint32_t pairWindowOpenedAt = 0;  // loop-owned
+
+// Identity addresses of bonded peers (the allowlist), capped at MAX_BONDS.
 static std::vector<NimBLEAddress> knownBonds;
+
+// Management ops that need NVS or multi-step teardown run in loop(), not on
+// the NimBLE host task. Fixed ring; overflow drops the op (logged).
+struct PendingOp {
+    uint8_t op;
+    uint8_t addr[7];  // 6B display-order address + 1B type
+    uint8_t nameLen;
+    char name[MAX_NAME_LEN];
+};
+static const size_t OP_QUEUE_LEN = 4;
+static PendingOp opQueue[OP_QUEUE_LEN];
+static volatile size_t opHead = 0;  // next slot to write (host task)
+static volatile size_t opTail = 0;  // next slot to read (loop)
+static portMUX_TYPE opMux = portMUX_INITIALIZER_UNLOCKED;
+
+static bool enqueueOp(const PendingOp& op) {
+    bool ok = false;
+    portENTER_CRITICAL(&opMux);
+    size_t next = (opHead + 1) % OP_QUEUE_LEN;
+    if (next != opTail) {
+        opQueue[opHead] = op;
+        opHead = next;
+        ok = true;
+    }
+    portEXIT_CRITICAL(&opMux);
+    return ok;
+}
+
+static bool dequeueOp(PendingOp& out) {
+    bool ok = false;
+    portENTER_CRITICAL(&opMux);
+    if (opTail != opHead) {
+        out = opQueue[opTail];
+        opTail = (opTail + 1) % OP_QUEUE_LEN;
+        ok = true;
+    }
+    portEXIT_CRITICAL(&opMux);
+    return ok;
+}
+
+// Connections that never reach an encrypted bonded state are dropped after
+// UNAUTH_TIMEOUT_MS. Slots keyed by connection handle.
+struct PeerAuth {
+    bool used;
+    bool authed;
+    uint16_t handle;
+    uint32_t since;
+};
+static PeerAuth authTable[MAX_CONNECTIONS];
+
+static void authTableAdd(uint16_t handle) {
+    for (auto& slot : authTable) {
+        if (!slot.used) {
+            slot = {true, false, handle, millis()};
+            return;
+        }
+    }
+}
+
+static void authTableMark(uint16_t handle) {
+    for (auto& slot : authTable) {
+        if (slot.used && slot.handle == handle) slot.authed = true;
+    }
+}
+
+static void authTableRemove(uint16_t handle) {
+    for (auto& slot : authTable) {
+        if (slot.used && slot.handle == handle) slot.used = false;
+    }
+}
 
 static bool isKnownBond(const NimBLEAddress& addr) {
     for (const auto& known : knownBonds) {
@@ -49,26 +157,44 @@ static bool isKnownBond(const NimBLEAddress& addr) {
     return false;
 }
 
+// NVS key: the identity address as 12 hex chars (NVS keys max 15 chars).
+static String nameKey(const NimBLEAddress& addr) {
+    std::string s = addr.toString();
+    String key;
+    for (char c : s) {
+        if (c != ':') key += c;
+    }
+    return key;
+}
+
+static void blinkLed(int times, uint32_t periodMs) {
+    for (int i = 0; i < times; i++) {
+        digitalWrite(LED_BUILTIN, LOW);
+        delay(periodMs / 2);
+        digitalWrite(LED_BUILTIN, HIGH);
+        delay(periodMs / 2);
+    }
+}
+
 static void factoryReset() {
-    Serial.println("Factory reset: erasing bond");
+    Serial.println("Factory reset: erasing all bonds and names");
     NimBLEDevice::deleteAllBonds();
     knownBonds.clear();
-    for (int i = 0; i < 6; i++) {  // acknowledge with a blink
-        digitalWrite(LED_BUILTIN, LOW);
-        delay(150);
-        digitalWrite(LED_BUILTIN, HIGH);
-        delay(150);
-    }
+    namesPrefs.clear();
+    pairWindowOpen = false;
+    blinkLed(6, 300);  // acknowledge
 }
 
 class ServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer*, NimBLEConnInfo& connInfo) override {
         Serial.printf("Connected: %s\n", connInfo.getAddress().toString().c_str());
+        authTableAdd(connInfo.getConnHandle());
     }
 
     void onDisconnect(NimBLEServer*, NimBLEConnInfo& connInfo, int reason) override {
         Serial.printf("Disconnected: %s (reason %d)\n",
                       connInfo.getAddress().toString().c_str(), reason);
+        authTableRemove(connInfo.getConnHandle());
     }
 
     void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
@@ -81,37 +207,166 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         NimBLEAddress peer = connInfo.getIdAddress();
         if (isKnownBond(peer)) {
             Serial.printf("Authenticated: %s\n", peer.toString().c_str());
+            authTableMark(connInfo.getConnHandle());
             return;
         }
 
-        // New bond: only allowed while the owner slot is empty.
-        if (!knownBonds.empty()) {
-            Serial.printf("Rejecting second device %s (already bonded to one)\n",
-                          peer.toString().c_str());
-            server->disconnect(connInfo.getConnHandle());
-            NimBLEDevice::deleteBond(peer);
+        // New bond: allowed while the allowlist is empty (first-time setup)
+        // or the pairing window is open, and only below the cap.
+        if ((knownBonds.empty() || pairWindowOpen) && knownBonds.size() < MAX_BONDS) {
+            knownBonds.push_back(peer);
+            pairWindowOpen = false;  // one new phone per window
+            authTableMark(connInfo.getConnHandle());
+            Serial.printf("Bonded: %s (%d/%d)\n", peer.toString().c_str(),
+                          (int)knownBonds.size(), (int)MAX_BONDS);
             return;
         }
 
-        knownBonds.push_back(peer);
-        Serial.printf("Bonded to owner: %s\n", peer.toString().c_str());
+        Serial.printf("Rejecting %s (window closed or allowlist full)\n",
+                      peer.toString().c_str());
+        server->disconnect(connInfo.getConnHandle());
+        NimBLEDevice::deleteBond(peer);
     }
 };
+
+// Shared guard for the trigger and management characteristics: the write
+// must arrive on an encrypted bonded link from an allowlisted phone.
+// WRITE_ENC already gates encryption at the ATT layer; re-check anyway so a
+// stack quirk can't turn an unauthorized write into a door pulse.
+static bool writeAuthorized(NimBLEConnInfo& connInfo) {
+    if (connInfo.isEncrypted() && connInfo.isBonded() &&
+        isKnownBond(connInfo.getIdAddress())) {
+        return true;
+    }
+    Serial.println("Write on unauthorized link; dropping");
+    server->disconnect(connInfo.getConnHandle());
+    return false;
+}
 
 class TriggerCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic*, NimBLEConnInfo& connInfo) override {
-        // WRITE_ENC already gates this at the ATT layer, and only the owner
-        // can ever hold a bond; re-check anyway so a stack quirk can't turn
-        // an unencrypted write into a door pulse.
-        if (!connInfo.isEncrypted() || !connInfo.isBonded() ||
-            !isKnownBond(connInfo.getIdAddress())) {
-            Serial.println("Write on unauthorized link; dropping");
-            server->disconnect(connInfo.getConnHandle());
-            return;
-        }
+        if (!writeAuthorized(connInfo)) return;
         triggerRequested = true;
     }
 };
+
+class MgmtCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* chr, NimBLEConnInfo& connInfo) override {
+        if (!writeAuthorized(connInfo)) return;
+        NimBLEAttValue value = chr->getValue();
+        // Malformed payloads from a bonded phone are logged and ignored —
+        // don't drop an owner over an app bug.
+        if (value.size() < 1) {
+            Serial.println("Mgmt write: empty; ignored");
+            return;
+        }
+        switch (value[0]) {
+            case OP_OPEN_WINDOW:
+                if (value.size() == 1) {
+                    pairWindowOpenRequested = true;
+                } else {
+                    Serial.println("Mgmt write: bad open-window length; ignored");
+                }
+                break;
+            case OP_UNPAIR: {
+                if (value.size() != 8) {
+                    Serial.println("Mgmt write: bad unpair length; ignored");
+                    break;
+                }
+                PendingOp op = {};
+                op.op = OP_UNPAIR;
+                memcpy(op.addr, value.data() + 1, 7);
+                if (!enqueueOp(op)) Serial.println("Mgmt op queue full; dropped");
+                break;
+            }
+            case OP_SET_NAME: {
+                if (value.size() > 1 + MAX_NAME_LEN) {
+                    Serial.println("Mgmt write: name too long; ignored");
+                    break;
+                }
+                PendingOp op = {};
+                op.op = OP_SET_NAME;
+                // The name applies to the CALLER; capture its identity
+                // address (display order + type) for the loop.
+                NimBLEAddress peer = connInfo.getIdAddress();
+                for (int i = 0; i < 6; i++) op.addr[i] = peer.getBase()->val[5 - i];
+                op.addr[6] = peer.getBase()->type;
+                op.nameLen = value.size() - 1;
+                memcpy(op.name, value.data() + 1, op.nameLen);
+                if (!enqueueOp(op)) Serial.println("Mgmt op queue full; dropped");
+                break;
+            }
+            default:
+                Serial.printf("Mgmt write: unknown opcode 0x%02x; ignored\n", value[0]);
+        }
+    }
+};
+
+class BondListCallbacks : public NimBLECharacteristicCallbacks {
+    void onRead(NimBLECharacteristic* chr, NimBLEConnInfo& connInfo) override {
+        // Serve the real list only to allowlisted phones; others get an
+        // empty (but well-formed) list.
+        uint8_t buf[2 + MAX_BONDS * (9 + MAX_NAME_LEN)];
+        buf[0] = 1;  // format version
+        buf[1] = 0;
+        size_t len = 2;
+        if (connInfo.isEncrypted() && connInfo.isBonded() &&
+            isKnownBond(connInfo.getIdAddress())) {
+            NimBLEAddress self = connInfo.getIdAddress();
+            buf[1] = (uint8_t)knownBonds.size();
+            for (const auto& bond : knownBonds) {
+                for (int i = 0; i < 6; i++) buf[len + i] = bond.getBase()->val[5 - i];
+                buf[len + 6] = bond.getBase()->type;
+                buf[len + 7] = (bond == self) ? 0x01 : 0x00;
+                String name = namesPrefs.getString(nameKey(bond).c_str(), "");
+                uint8_t nameLen = min((size_t)name.length(), MAX_NAME_LEN);
+                buf[len + 8] = nameLen;
+                memcpy(buf + len + 9, name.c_str(), nameLen);
+                len += 9 + nameLen;
+            }
+        }
+        chr->setValue(buf, len);
+    }
+};
+
+static void executeUnpair(const uint8_t* entry) {  // 6B display-order + 1B type
+    NimBLEAddress target(entry, entry[6]);
+    bool found = false;
+    for (auto it = knownBonds.begin(); it != knownBonds.end(); ++it) {
+        if (*it == target) {
+            knownBonds.erase(it);
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        Serial.printf("Unpair: %s not in allowlist; ignored\n", target.toString().c_str());
+        return;
+    }
+    NimBLEDevice::deleteBond(target);
+    namesPrefs.remove(nameKey(target).c_str());
+    for (int i = server->getConnectedCount() - 1; i >= 0; i--) {
+        NimBLEConnInfo peer = server->getPeerInfo(i);
+        if (peer.getIdAddress() == target) server->disconnect(peer.getConnHandle());
+    }
+    Serial.printf("Unpaired %s (%d bonds left)\n", target.toString().c_str(),
+                  (int)knownBonds.size());
+}
+
+static void executeSetName(const PendingOp& op) {
+    NimBLEAddress target(op.addr, op.addr[6]);
+    if (!isKnownBond(target)) return;  // unpaired while queued
+    String key = nameKey(target);
+    if (op.nameLen == 0) {
+        namesPrefs.remove(key.c_str());
+    } else {
+        char name[MAX_NAME_LEN + 1];
+        memcpy(name, op.name, op.nameLen);
+        name[op.nameLen] = '\0';
+        namesPrefs.putString(key.c_str(), name);
+        Serial.printf("Named %s \"%s\"\n", target.toString().c_str(), name);
+    }
+}
 
 void setup() {
     // Make the output state deterministic before anything else runs.
@@ -124,6 +379,8 @@ void setup() {
 
     Serial.begin(115200);
 
+    namesPrefs.begin("grnames", false);
+
     NimBLEDevice::init(DEVICE_NAME);
     // Just Works pairing: bonding + LE Secure Connections, no passkey.
     NimBLEDevice::setSecurityAuth(/*bonding=*/true, /*mitm=*/false, /*sc=*/true);
@@ -135,13 +392,23 @@ void setup() {
 
     server = NimBLEDevice::createServer();
     server->setCallbacks(new ServerCallbacks());
-    server->advertiseOnDisconnect(true);
+    // Advertising is reconciled in loop() (we advertise while a free
+    // connection slot exists), not tied to disconnects.
+    server->advertiseOnDisconnect(false);
 
     NimBLEService* service = server->createService(SERVICE_UUID);
     NimBLECharacteristic* trigger = service->createCharacteristic(
         TRIGGER_CHAR_UUID,
         NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC);
     trigger->setCallbacks(new TriggerCallbacks());
+    NimBLECharacteristic* mgmt = service->createCharacteristic(
+        MGMT_CHAR_UUID,
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC);
+    mgmt->setCallbacks(new MgmtCallbacks());
+    NimBLECharacteristic* bondList = service->createCharacteristic(
+        BOND_LIST_CHAR_UUID,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC);
+    bondList->setCallbacks(new BondListCallbacks());
     service->start();
 
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
@@ -154,25 +421,87 @@ void setup() {
                   (int)knownBonds.size());
 }
 
-// Millis timestamp when the BOOT button was first seen held; 0 = not held.
+// BOOT button state: millis timestamp when first seen held (0 = not held),
+// plus a latch so a 3s hold factory-resets once and its release doesn't
+// count as a short press.
 static uint32_t buttonHeldSince = 0;
+static bool resetFiredThisHold = false;
+static bool prevWindowOpen = false;
 
 void loop() {
+    uint32_t now = millis();
+
+    // --- BOOT button: short press = pairing window, 3s hold = factory reset
     if (digitalRead(RESET_BUTTON_PIN) == LOW) {
-        uint32_t now = millis();
         if (buttonHeldSince == 0) {
             buttonHeldSince = now;
-        } else if (now - buttonHeldSince >= RESET_HOLD_MS) {
+        } else if (!resetFiredThisHold && now - buttonHeldSince >= RESET_HOLD_MS) {
             factoryReset();
-            buttonHeldSince = 0;
+            resetFiredThisHold = true;  // once per hold
         }
     } else {
+        if (buttonHeldSince != 0 && !resetFiredThisHold &&
+            now - buttonHeldSince >= BUTTON_DEBOUNCE_MS) {
+            pairWindowOpenRequested = true;
+        }
         buttonHeldSince = 0;
+        resetFiredThisHold = false;
     }
 
+    // --- Drain management ops (NVS writes / teardown off the host task)
+    PendingOp op;
+    while (dequeueOp(op)) {
+        if (op.op == OP_UNPAIR) executeUnpair(op.addr);
+        else if (op.op == OP_SET_NAME) executeSetName(op);
+    }
+
+    // --- Pairing window lifecycle
+    if (pairWindowOpenRequested) {
+        pairWindowOpenRequested = false;
+        if (knownBonds.size() >= MAX_BONDS) {
+            Serial.println("Pairing window refused: allowlist full");
+            blinkLed(3, 200);
+        } else {
+            pairWindowOpen = true;
+            pairWindowOpenedAt = now;  // re-open restarts the 30s
+            Serial.println("Pairing window open (30s)");
+        }
+    }
+    if (pairWindowOpen && now - pairWindowOpenedAt >= PAIRING_WINDOW_MS) {
+        pairWindowOpen = false;
+        Serial.println("Pairing window timed out");
+    }
+    if (pairWindowOpen) {
+        // Slow blink while open (LED is active-low).
+        digitalWrite(LED_BUILTIN, ((now - pairWindowOpenedAt) % 500 < 250) ? LOW : HIGH);
+    } else if (prevWindowOpen) {
+        digitalWrite(LED_BUILTIN, HIGH);
+        // Evict peers that connected during the window but never paired.
+        for (int i = server->getConnectedCount() - 1; i >= 0; i--) {
+            NimBLEConnInfo peer = server->getPeerInfo(i);
+            if (!isKnownBond(peer.getIdAddress())) server->disconnect(peer.getConnHandle());
+        }
+    }
+    prevWindowOpen = pairWindowOpen;
+
+    // --- Unauthenticated-peer watchdog
+    for (auto& slot : authTable) {
+        if (slot.used && !slot.authed && now - slot.since >= UNAUTH_TIMEOUT_MS) {
+            Serial.printf("Dropping unauthenticated connection (handle %d)\n", slot.handle);
+            server->disconnect(slot.handle);
+            slot.used = false;  // onDisconnect would also clear it
+        }
+    }
+
+    // --- Advertising reconciler: advertise while a free slot exists
+    NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+    bool wantAdv = server->getConnectedCount() < MAX_CONNECTIONS;
+    if (wantAdv && !adv->isAdvertising()) adv->start();
+    else if (!wantAdv && adv->isAdvertising()) adv->stop();
+
+    // --- Trigger pulse
     if (triggerRequested) {
         triggerRequested = false;
-        uint32_t now = millis();
         if (now - lastPulseAt >= COOLDOWN_MS) {
             lastPulseAt = now;
             Serial.println("Pulsing trigger");

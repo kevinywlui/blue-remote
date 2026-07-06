@@ -25,7 +25,8 @@ import kotlinx.coroutines.launch
 data class ErrorInfo(val cause: ErrorCause) {
     val securityRelevant: Boolean
         get() = cause == ErrorCause.STALE_BOND ||
-            cause == ErrorCause.PAIRING_REJECTED
+            cause == ErrorCause.PAIRING_REJECTED ||
+            cause == ErrorCause.UNPAIRED_SELF
 }
 
 /** Errors are IDLE plus a payload (plan §3) — never message-string sniffing. */
@@ -56,6 +57,9 @@ class GarageViewModel(app: Application) :
         // Firmware cooldown is 2s; padded so our window never ends first (§3).
         const val COOLDOWN_MS = 2200L
         private const val GRACE_MS = 2500L
+        private const val PHONES_POLL_MS = 5_000L
+        // The firmware executes unpairs from its loop; re-read shortly after.
+        private const val PHONES_REFRESH_DELAY_MS = 400L
         private const val TEARDOWN_HARD_CAP_MS = 35_000L
         private const val SYSTEM_ACTIVITY_GUARD_TIMEOUT_MS = 60_000L
 
@@ -82,6 +86,16 @@ class GarageViewModel(app: Application) :
     private val _uiState = MutableStateFlow<UiState>(UiState.Idle())
     val uiState: StateFlow<UiState> = _uiState.asStateFlow()
 
+    // Sticky once a management-capable firmware is seen; drives whether the
+    // Phones section exists at all (old firmware hides it).
+    private val _phonesAvailable = MutableStateFlow(false)
+    val phonesAvailable: StateFlow<Boolean> = _phonesAvailable.asStateFlow()
+
+    // Last-read bond allowlist; kept across disconnects (actions are gated
+    // on Ready, the cached list is display-only).
+    private val _pairedDevices = MutableStateFlow<List<PairedDevice>>(emptyList())
+    val pairedDevices: StateFlow<List<PairedDevice>> = _pairedDevices.asStateFlow()
+
     // One-shot events; a Channel buffers across recreation (plan §3).
     private val snackChannel = Channel<SnackEvent>(
         capacity = Channel.BUFFERED, onBufferOverflow = BufferOverflow.DROP_OLDEST,
@@ -93,6 +107,11 @@ class GarageViewModel(app: Application) :
     // Persisted security guidance; survives stop/start, shown as READY's
     // detail line after reconnect until the user acts.
     private var lastSecurityError: ErrorInfo? = null
+
+    // Set when the user confirmed unpairing THIS phone; the resulting
+    // disconnect is expected and must not trigger the silent reconnect.
+    private var expectSelfUnpair = false
+    private var phonesPollJob: Job? = null
 
     private var started = false
     private var graceJob: Job? = null
@@ -140,6 +159,36 @@ class GarageViewModel(app: Application) :
     fun trigger() {
         if (_uiState.value !is UiState.Ready) return
         client.trigger()
+    }
+
+    fun openPairingWindow() {
+        if (_uiState.value !is UiState.Ready) return
+        client.openPairingWindow()
+    }
+
+    fun unpair(device: PairedDevice) {
+        if (_uiState.value !is UiState.Ready) return
+        if (device.isSelf) expectSelfUnpair = true
+        client.unpair(device.rawEntry)
+    }
+
+    /** The Settings sheet drives list refresh + a light poll while visible. */
+    fun onPhonesSheetVisible(visible: Boolean) {
+        phonesPollJob?.cancel()
+        if (!visible) return
+        refreshPhones()
+        phonesPollJob = viewModelScope.launch {
+            while (true) {
+                delay(PHONES_POLL_MS)
+                refreshPhones()
+            }
+        }
+    }
+
+    private fun refreshPhones() {
+        if (_phonesAvailable.value && _uiState.value is UiState.Ready) {
+            client.readBondList()
+        }
     }
 
     /** Set right before launching ACTION_REQUEST_ENABLE / settings deep links (§4). */
@@ -234,10 +283,12 @@ class GarageViewModel(app: Application) :
         _uiState.value = UiState.Bonding
     }
 
-    override fun onReady(newlyBonded: Boolean) {
+    override fun onReady(newlyBonded: Boolean, hasManagement: Boolean) {
         if (newlyBonded) lastSecurityError = null // user re-paired: acted
         midSessionRetryUsed = false
+        _phonesAvailable.value = hasManagement
         _uiState.value = UiState.Ready(lastSecurityError)
+        if (hasManagement) refreshPhones()
         maybeRunPendingTeardown()
     }
 
@@ -248,7 +299,7 @@ class GarageViewModel(app: Application) :
             ErrorCause.NOT_FOUND -> snack("Board not found — is it powered and in range?", retry = true)
             ErrorCause.SCAN_FAILED -> snack("Bluetooth scan failed", retry = true)
             ErrorCause.PAIRING_REJECTED ->
-                snack("Pairing failed — another phone may own the board")
+                snack("Pairing failed — open the pairing window from a paired phone first")
             ErrorCause.STALE_BOND ->
                 snack("Connection keeps failing — remove the old pairing in Bluetooth settings")
             ErrorCause.NO_TRIGGER_CHAR -> snack("Unexpected device — wrong board?")
@@ -293,11 +344,51 @@ class GarageViewModel(app: Application) :
         maybeRunPendingTeardown() // a failed write also resolves TRIGGERING (§4)
     }
 
+    override fun onMgmtWriteResult(kind: MgmtOp, success: Boolean) {
+        when (kind) {
+            MgmtOp.OPEN_WINDOW ->
+                if (success) {
+                    snack("Pairing open for 30 seconds — connect from the new phone now")
+                } else {
+                    snack("Couldn't open pairing — try again")
+                }
+            MgmtOp.UNPAIR ->
+                if (success) {
+                    viewModelScope.launch {
+                        delay(PHONES_REFRESH_DELAY_MS)
+                        refreshPhones()
+                    }
+                } else {
+                    expectSelfUnpair = false
+                    snack("Couldn't remove the phone — try again")
+                }
+            MgmtOp.SET_NAME -> Unit // best-effort; the list just shows the address
+        }
+    }
+
+    override fun onBondList(devices: List<PairedDevice>) {
+        _pairedDevices.value = devices
+    }
+
+    override fun onBondListFailed(status: Int) = Unit // poll/next refresh retries
+
     override fun onDisconnected(clientInitiated: Boolean) {
         val state = _uiState.value
         cooldownJob?.cancel()
         if (clientInitiated) {
             setIdle(null)
+            return
+        }
+        // The board dropping us right after we unpaired THIS phone is the
+        // expected outcome, not a lost link: land on the persistent
+        // "access removed" guidance and don't silently reconnect.
+        if (expectSelfUnpair) {
+            expectSelfUnpair = false
+            AppPrefs.setDeviceMac(appContext, null)
+            _pairedDevices.value = emptyList()
+            lastSecurityError = ErrorInfo(ErrorCause.UNPAIRED_SELF)
+            setIdle(lastSecurityError)
+            maybeRunPendingTeardown()
             return
         }
         // One bounded silent reconnect on a mid-session drop from READY (§4).

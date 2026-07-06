@@ -28,7 +28,28 @@ import java.util.UUID
 enum class ErrorCause {
     NOT_FOUND, BLUETOOTH_OFF, LOCATION_OFF, PERMISSION_MISSING,
     PERMISSION_DENIED_PERMANENTLY, SCAN_FAILED,
-    PAIRING_REJECTED, STALE_BOND, LINK_LOST, NO_TRIGGER_CHAR,
+    PAIRING_REJECTED, STALE_BOND, UNPAIRED_SELF, LINK_LOST, NO_TRIGGER_CHAR,
+}
+
+/** Management opcodes the app can send to the board. */
+enum class MgmtOp { OPEN_WINDOW, UNPAIR, SET_NAME }
+
+/**
+ * One entry of the board's bond allowlist. [rawEntry] is the 7-byte wire
+ * form (6B address in display order + 1B address type) echoed verbatim to
+ * unpair; [isSelf] is computed by the firmware per connection — the app can
+ * never learn its own identity address (Android hides it).
+ */
+class PairedDevice(
+    val address: String,
+    val rawEntry: ByteArray,
+    val name: String?,
+    val isSelf: Boolean,
+) {
+    override fun equals(other: Any?): Boolean = other is PairedDevice &&
+        other.rawEntry.contentEquals(rawEntry) && other.name == name && other.isSelf == isSelf
+
+    override fun hashCode(): Int = rawEntry.contentHashCode() * 31 + (name?.hashCode() ?: 0)
 }
 
 /**
@@ -50,7 +71,8 @@ class GarageBleClient(
         fun onScanStarted()
         fun onConnecting()
         fun onBonding()
-        fun onReady(newlyBonded: Boolean)
+        /** [hasManagement] = firmware exposes the pairing/bond-list protocol. */
+        fun onReady(newlyBonded: Boolean, hasManagement: Boolean)
         /** Terminal failure of a connect attempt or session; client is now idle. */
         fun onFailed(cause: ErrorCause)
         /** "Pairing was removed — setting up again" note before re-scan. */
@@ -58,6 +80,9 @@ class GarageBleClient(
         fun onWriteIssued()
         fun onWriteSuccess()
         fun onWriteFailed(status: Int, insufficientAuth: Boolean)
+        fun onMgmtWriteResult(kind: MgmtOp, success: Boolean)
+        fun onBondList(devices: List<PairedDevice>)
+        fun onBondListFailed(status: Int)
         /** Link ended. [clientInitiated] includes adapter-off cleanup. */
         fun onDisconnected(clientInitiated: Boolean)
         fun onAdapterOn()
@@ -68,8 +93,17 @@ class GarageBleClient(
     companion object {
         val SERVICE_UUID: UUID = UUID.fromString("4090b92d-a8da-471a-85a8-aee612b68bad")
         val TRIGGER_UUID: UUID = UUID.fromString("588a322e-4b88-4197-8f4e-a5f48417c8b7")
+        val MGMT_UUID: UUID = UUID.fromString("f34dd3a3-ed37-4822-9d08-f96ee2974856")
+        val BOND_LIST_UUID: UUID = UUID.fromString("8d3a66f6-42a0-4d0b-8a56-3a9f2f8e5c01")
         // The bond is the credential; the payload just says "pulse".
         private val TRIGGER_PAYLOAD = byteArrayOf(0x01)
+        private const val OP_OPEN_WINDOW: Byte = 0x01
+        private const val OP_UNPAIR: Byte = 0x02
+        private const val OP_SET_NAME: Byte = 0x03
+        private const val MAX_NAME_BYTES = 24
+        // Fits the worst-case bond list (101B) and the name write in single
+        // ATT ops; Android's transparent blob-read remains the fallback.
+        private const val REQUEST_MTU = 247
         private const val SCAN_TIMEOUT_MS = 15_000L
         private const val DIRECT_CONNECT_TIMEOUT_MS = 10_000L
         private const val GATT_INSUFFICIENT_AUTHENTICATION = 0x5
@@ -89,6 +123,8 @@ class GarageBleClient(
 
     private var gatt: BluetoothGatt? = null
     private var triggerChar: BluetoothGattCharacteristic? = null
+    private var mgmtChar: BluetoothGattCharacteristic? = null
+    private var bondListChar: BluetoothGattCharacteristic? = null
     private var device: BluetoothDevice? = null
     private var scanning = false
     private var directAttempt = false
@@ -159,15 +195,34 @@ class GarageBleClient(
     }
 
     fun trigger() {
-        val gatt = gatt
-        val characteristic = triggerChar
-        if (phase != Phase.CONNECTED || gatt == null || characteristic == null) return
-        writeRetried = false
-        if (issueWrite(gatt, characteristic)) {
-            listener.onWriteIssued()
-        } else {
-            listener.onWriteFailed(-1, insufficientAuth = false)
+        if (phase != Phase.CONNECTED || triggerChar == null) return
+        listener.onWriteIssued()
+        enqueueOp(GattOp.Trigger)
+    }
+
+    fun openPairingWindow() {
+        if (phase != Phase.CONNECTED || mgmtChar == null) {
+            listener.onMgmtWriteResult(MgmtOp.OPEN_WINDOW, success = false)
+            return
         }
+        enqueueOp(GattOp.MgmtWrite(MgmtOp.OPEN_WINDOW, byteArrayOf(OP_OPEN_WINDOW)))
+    }
+
+    /** [rawEntry] must be the 7 wire bytes of a [PairedDevice], verbatim. */
+    fun unpair(rawEntry: ByteArray) {
+        if (phase != Phase.CONNECTED || mgmtChar == null || rawEntry.size != 7) {
+            listener.onMgmtWriteResult(MgmtOp.UNPAIR, success = false)
+            return
+        }
+        enqueueOp(GattOp.MgmtWrite(MgmtOp.UNPAIR, byteArrayOf(OP_UNPAIR) + rawEntry))
+    }
+
+    fun readBondList() {
+        if (phase != Phase.CONNECTED || bondListChar == null) {
+            listener.onBondListFailed(-1)
+            return
+        }
+        enqueueOp(GattOp.ListRead)
     }
 
     /** Full teardown; never raises error events beyond onDisconnected(clientInitiated=true). */
@@ -175,6 +230,103 @@ class GarageBleClient(
         val hadLink = gatt != null || scanning || directAttempt
         cleanup()
         if (hadLink) listener.onDisconnected(clientInitiated = true)
+    }
+
+    // ---------------------------------------------------------- gatt op queue
+    // GATT allows one outstanding operation; the trigger, management writes,
+    // and the bond-list read share a FIFO so they never collide. The
+    // in-flight op is completed by onCharacteristicWrite/-Read (dispatched
+    // by characteristic UUID) or by onMtuChanged for the MTU exchange.
+
+    private sealed interface GattOp {
+        data object Trigger : GattOp
+        data class MgmtWrite(val kind: MgmtOp, val payload: ByteArray) : GattOp
+        data object ListRead : GattOp
+    }
+
+    private val opQueue = ArrayDeque<GattOp>()
+    private var opInFlight: GattOp? = null
+    private var mtuPending = false
+
+    private fun enqueueOp(op: GattOp) {
+        opQueue.addLast(op)
+        pumpOps()
+    }
+
+    private fun pumpOps() {
+        if (opInFlight != null || mtuPending || phase != Phase.CONNECTED) return
+        val g = gatt ?: return
+        while (opQueue.isNotEmpty()) {
+            val op = opQueue.removeFirst()
+            val started = when (op) {
+                is GattOp.Trigger -> {
+                    writeRetried = false
+                    triggerChar?.let { issueWrite(g, it, TRIGGER_PAYLOAD) } ?: false
+                }
+                is GattOp.MgmtWrite -> mgmtChar?.let { issueWrite(g, it, op.payload) } ?: false
+                is GattOp.ListRead -> bondListChar?.let { g.readCharacteristic(it) } ?: false
+            }
+            if (started) {
+                opInFlight = op
+                return
+            }
+            reportOpFailure(op)
+        }
+    }
+
+    private fun reportOpFailure(op: GattOp) {
+        when (op) {
+            is GattOp.Trigger -> listener.onWriteFailed(-1, insufficientAuth = false)
+            is GattOp.MgmtWrite -> listener.onMgmtWriteResult(op.kind, success = false)
+            is GattOp.ListRead -> listener.onBondListFailed(-1)
+        }
+    }
+
+    private fun completeOp() {
+        opInFlight = null
+        pumpOps()
+    }
+
+    private fun clearOps() {
+        opQueue.clear()
+        opInFlight = null
+        mtuPending = false
+    }
+
+    /** This phone's Bluetooth name, truncated to 24 UTF-8 bytes at a codepoint boundary. */
+    private fun localNameBytes(): ByteArray {
+        val raw = (runCatching { adapter?.name }.getOrNull() ?: Build.MODEL).trim()
+        val sb = StringBuilder()
+        var i = 0
+        while (i < raw.length) {
+            val next = i + Character.charCount(raw.codePointAt(i))
+            if ((sb.toString() + raw.substring(i, next)).toByteArray(Charsets.UTF_8).size >
+                MAX_NAME_BYTES
+            ) break
+            sb.append(raw, i, next)
+            i = next
+        }
+        return sb.toString().toByteArray(Charsets.UTF_8)
+    }
+
+    /** Wire format: [version=1][count] then per entry [6B addr][type][flags][nameLen][name]. */
+    private fun parseBondList(data: ByteArray): List<PairedDevice>? {
+        if (data.size < 2 || data[0].toInt() != 1) return null
+        val count = data[1].toInt() and 0xff
+        val out = mutableListOf<PairedDevice>()
+        var i = 2
+        repeat(count) {
+            if (i + 9 > data.size) return null
+            val raw = data.copyOfRange(i, i + 7)
+            val flags = data[i + 7].toInt()
+            val nameLen = data[i + 8].toInt() and 0xff
+            if (i + 9 + nameLen > data.size) return null
+            val name = if (nameLen > 0) String(data, i + 9, nameLen, Charsets.UTF_8) else null
+            val address = raw.take(6).joinToString(":") { "%02X".format(it) }
+            out += PairedDevice(address, raw, name, flags and 0x01 != 0)
+            i += 9 + nameLen
+        }
+        return out
     }
 
     // ------------------------------------------------------------- internals
@@ -191,6 +343,9 @@ class GarageBleClient(
         gatt?.let { orphanedGatts.remove(it); it.close() }
         gatt = null
         triggerChar = null
+        mgmtChar = null
+        bondListChar = null
+        clearOps()
         device = null
         directAttempt = false
         toIdle()
@@ -282,15 +437,16 @@ class GarageBleClient(
     private fun issueWrite(
         g: BluetoothGatt,
         characteristic: BluetoothGattCharacteristic,
+        payload: ByteArray,
     ): Boolean = if (Build.VERSION.SDK_INT >= 33) {
         g.writeCharacteristic(
-            characteristic, TRIGGER_PAYLOAD, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+            characteristic, payload, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
         ) == BluetoothGatt.GATT_SUCCESS
     } else {
         @Suppress("DEPRECATION")
         run {
             characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            characteristic.value = TRIGGER_PAYLOAD
+            characteristic.value = payload
             g.writeCharacteristic(characteristic)
         }
     }
@@ -319,7 +475,8 @@ class GarageBleClient(
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             handler.post {
                 if (gatt !== g) return@post
-                val characteristic = g.getService(SERVICE_UUID)?.getCharacteristic(TRIGGER_UUID)
+                val service = g.getService(SERVICE_UUID)
+                val characteristic = service?.getCharacteristic(TRIGGER_UUID)
                 if (characteristic == null) {
                     cleanup()
                     listener.onFailed(ErrorCause.NO_TRIGGER_CHAR)
@@ -328,6 +485,15 @@ class GarageBleClient(
                 discoveryCompleted = true
                 earlyDisconnects.clear()
                 triggerChar = characteristic
+                // Optional on older firmware; their absence just hides the
+                // phone-management UI.
+                mgmtChar = service.getCharacteristic(MGMT_UUID)
+                bondListChar = service.getCharacteristic(BOND_LIST_UUID)
+                if (bondListChar != null && g.requestMtu(REQUEST_MTU)) {
+                    // The exchange is itself a GATT op; hold the queue until
+                    // onMtuChanged so the first write/read can't collide.
+                    mtuPending = true
+                }
                 val dev = g.device
                 when (dev.bondState) {
                     BluetoothDevice.BOND_BONDED -> onLinkReady(newlyBonded = false)
@@ -348,30 +514,98 @@ class GarageBleClient(
         ) {
             handler.post {
                 if (gatt !== g) return@post
-                val insufficient = status == GATT_INSUFFICIENT_AUTHENTICATION ||
-                    status == GATT_INSUFFICIENT_ENCRYPTION
-                when {
-                    status == BluetoothGatt.GATT_SUCCESS -> listener.onWriteSuccess()
-                    // One silent retry, only for the bond-complete-before-
-                    // encryption race, only after the bond receiver observed
-                    // BOND_BONDED this session (§3).
-                    insufficient && newlyBondedThisSession && !writeRetried -> {
-                        writeRetried = true
-                        val chr = triggerChar
-                        val cur = gatt
-                        if (chr != null && cur != null && issueWrite(cur, chr)) return@post
-                        listener.onWriteFailed(status, insufficientAuth = true)
+                when (characteristic.uuid) {
+                    TRIGGER_UUID -> onTriggerWriteResult(status)
+                    MGMT_UUID -> {
+                        (opInFlight as? GattOp.MgmtWrite)?.let {
+                            listener.onMgmtWriteResult(it.kind, status == BluetoothGatt.GATT_SUCCESS)
+                        }
+                        completeOp()
                     }
-                    else -> listener.onWriteFailed(status, insufficientAuth = insufficient)
                 }
             }
         }
+
+        override fun onCharacteristicRead(
+            g: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
+            status: Int,
+        ) {
+            handler.post { handleRead(g, characteristic, value, status) }
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun onCharacteristicRead(
+            g: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int,
+        ) {
+            if (Build.VERSION.SDK_INT >= 33) return // the value variant delivers on 33+
+            @Suppress("DEPRECATION") val value = characteristic.value ?: ByteArray(0)
+            handler.post { handleRead(g, characteristic, value, status) }
+        }
+
+        override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
+            handler.post {
+                if (gatt !== g) return@post
+                mtuPending = false
+                pumpOps()
+            }
+        }
+    }
+
+    private fun onTriggerWriteResult(status: Int) {
+        val insufficient = status == GATT_INSUFFICIENT_AUTHENTICATION ||
+            status == GATT_INSUFFICIENT_ENCRYPTION
+        when {
+            status == BluetoothGatt.GATT_SUCCESS -> {
+                listener.onWriteSuccess()
+                completeOp()
+            }
+            // One silent retry, only for the bond-complete-before-encryption
+            // race, only after the bond receiver observed BOND_BONDED this
+            // session (§3). The op stays in flight across the retry.
+            insufficient && newlyBondedThisSession && !writeRetried -> {
+                writeRetried = true
+                val chr = triggerChar
+                val cur = gatt
+                if (chr != null && cur != null && issueWrite(cur, chr, TRIGGER_PAYLOAD)) return
+                listener.onWriteFailed(status, insufficientAuth = true)
+                completeOp()
+            }
+            else -> {
+                listener.onWriteFailed(status, insufficientAuth = insufficient)
+                completeOp()
+            }
+        }
+    }
+
+    private fun handleRead(
+        g: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+        value: ByteArray,
+        status: Int,
+    ) {
+        if (gatt !== g || characteristic.uuid != BOND_LIST_UUID) return
+        if (status == BluetoothGatt.GATT_SUCCESS) {
+            val list = parseBondList(value)
+            if (list != null) listener.onBondList(list) else listener.onBondListFailed(status)
+        } else {
+            listener.onBondListFailed(status)
+        }
+        completeOp()
     }
 
     private fun onLinkReady(newlyBonded: Boolean) {
         phase = Phase.CONNECTED
         device?.let { AppPrefs.setDeviceMac(context, it.address) }
-        listener.onReady(newlyBonded)
+        if (newlyBonded && mgmtChar != null) {
+            // Register this phone's name so it shows up usefully in every
+            // phone's paired-device list.
+            enqueueOp(GattOp.MgmtWrite(MgmtOp.SET_NAME, byteArrayOf(OP_SET_NAME) + localNameBytes()))
+        }
+        listener.onReady(newlyBonded, hasManagement = mgmtChar != null && bondListChar != null)
     }
 
     private fun handleDisconnect(g: BluetoothGatt) {
@@ -384,6 +618,9 @@ class GarageBleClient(
         val wasConnectingOrUp = phase != Phase.IDLE
         gatt = null
         triggerChar = null
+        mgmtChar = null
+        bondListChar = null
+        clearOps()
         unregisterBondReceiver()
         handler.removeCallbacks(directTimeout)
         directAttempt = false
