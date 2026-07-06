@@ -280,7 +280,7 @@ private fun detailText(cause: ErrorCause): String? = when (cause) {
     ErrorCause.UNPAIRED_SELF ->
         "This phone was unpaired from the board. Also remove \"GarageRemote\" in your phone's Bluetooth settings. To pair again, open the pairing window from another paired phone — or factory-reset the board."
     ErrorCause.PAIRING_REJECTED ->
-        "Pairing is closed. Open it from an already-paired phone (Settings → Pair another phone) or short-press the board's BOOT button, then retry within 30 seconds."
+        "Pairing is closed. Open it from an already-paired phone (Settings → Pair another phone) or short-press the board's BOOT button, then retry within 30 seconds. If it still fails, remove \"GarageRemote\" in this phone's Bluetooth settings and try again."
     ErrorCause.NOT_FOUND -> "Make sure the board is powered and within range."
     ErrorCause.BLUETOOTH_OFF -> "Turn on Bluetooth to connect."
     ErrorCause.LOCATION_OFF -> "Android needs Location Services on for BLE scanning on this Android version."
