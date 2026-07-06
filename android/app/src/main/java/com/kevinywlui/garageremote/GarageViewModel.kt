@@ -60,6 +60,10 @@ class GarageViewModel(app: Application) :
         private const val PHONES_POLL_MS = 5_000L
         // The firmware executes unpairs from its loop; re-read shortly after.
         private const val PHONES_REFRESH_DELAY_MS = 400L
+        // A fresh bond that drops this soon with nothing confirmed was
+        // rejected by the board (window closed / list full).
+        private const val REJECTED_BOND_WINDOW_MS = 5_000L
+        const val MAX_BONDS = 3
         private const val TEARDOWN_HARD_CAP_MS = 35_000L
         private const val SYSTEM_ACTIVITY_GUARD_TIMEOUT_MS = 60_000L
 
@@ -86,8 +90,9 @@ class GarageViewModel(app: Application) :
     private val _uiState = MutableStateFlow<UiState>(UiState.Idle())
     val uiState: StateFlow<UiState> = _uiState.asStateFlow()
 
-    // Sticky once a management-capable firmware is seen; drives whether the
-    // Phones section exists at all (old firmware hides it).
+    // Whether the last-connected firmware exposes the pairing/bond-list
+    // protocol; drives whether the Phones section exists at all (old
+    // firmware hides it). Kept across disconnects, refreshed on each Ready.
     private val _phonesAvailable = MutableStateFlow(false)
     val phonesAvailable: StateFlow<Boolean> = _phonesAvailable.asStateFlow()
 
@@ -110,8 +115,21 @@ class GarageViewModel(app: Application) :
 
     // Set when the user confirmed unpairing THIS phone; the resulting
     // disconnect is expected and must not trigger the silent reconnect.
+    // Cleared on every path that proves the unpair didn't happen (write
+    // failure, a later Ready, a bond list still containing us, a
+    // client-initiated teardown that may have dropped the queued write) so
+    // a stale flag can't relabel an ordinary link loss as "access removed".
     private var expectSelfUnpair = false
     private var phonesPollJob: Job? = null
+
+    // Rejected-pairing detector (§ firmware rejects AFTER auth completes):
+    // a session that freshly bonded but never completed any operation and
+    // then dropped remotely within seconds was rejected by the board — the
+    // bond it just made was deleted board-side. Without this, the phone
+    // lands in the stale-bond loop whose advice sends the user in circles.
+    private var sessionNewlyBonded = false
+    private var sessionConfirmed = false
+    private var readyAt = 0L
 
     private var started = false
     private var graceJob: Job? = null
@@ -286,6 +304,10 @@ class GarageViewModel(app: Application) :
     override fun onReady(newlyBonded: Boolean, hasManagement: Boolean) {
         if (newlyBonded) lastSecurityError = null // user re-paired: acted
         midSessionRetryUsed = false
+        expectSelfUnpair = false // a new session invalidates a stale flag
+        sessionNewlyBonded = newlyBonded
+        sessionConfirmed = false
+        readyAt = android.os.SystemClock.elapsedRealtime()
         _phonesAvailable.value = hasManagement
         _uiState.value = UiState.Ready(lastSecurityError)
         if (hasManagement) refreshPhones()
@@ -317,6 +339,7 @@ class GarageViewModel(app: Application) :
     }
 
     override fun onWriteSuccess() {
+        sessionConfirmed = true
         if (_uiState.value !is UiState.Triggering) return
         _uiState.value = UiState.Cooldown
         cooldownJob?.cancel()
@@ -345,6 +368,7 @@ class GarageViewModel(app: Application) :
     }
 
     override fun onMgmtWriteResult(kind: MgmtOp, success: Boolean) {
+        if (success) sessionConfirmed = true
         when (kind) {
             MgmtOp.OPEN_WINDOW ->
                 if (success) {
@@ -367,6 +391,10 @@ class GarageViewModel(app: Application) :
     }
 
     override fun onBondList(devices: List<PairedDevice>) {
+        sessionConfirmed = true
+        // Still on the board's list: any pending self-unpair never executed
+        // (e.g. the firmware dropped the op).
+        if (devices.any { it.isSelf }) expectSelfUnpair = false
         _pairedDevices.value = devices
     }
 
@@ -376,6 +404,9 @@ class GarageViewModel(app: Application) :
         val state = _uiState.value
         cooldownJob?.cancel()
         if (clientInitiated) {
+            // Teardown may have dropped a queued self-unpair write without a
+            // result callback; don't let the flag outlive it.
+            expectSelfUnpair = false
             setIdle(null)
             return
         }
@@ -388,6 +419,21 @@ class GarageViewModel(app: Application) :
             _pairedDevices.value = emptyList()
             lastSecurityError = ErrorInfo(ErrorCause.UNPAIRED_SELF)
             setIdle(lastSecurityError)
+            maybeRunPendingTeardown()
+            return
+        }
+        // Rejected fresh bond: the firmware rejects a phone AFTER pairing
+        // completes, so the phone briefly reaches Ready and then gets
+        // dropped (its bond deleted board-side). Surface the pairing-window
+        // guidance instead of reconnect/stale-bond advice, and forget the
+        // MAC of a board that just rejected us.
+        if (sessionNewlyBonded && !sessionConfirmed &&
+            android.os.SystemClock.elapsedRealtime() - readyAt <= REJECTED_BOND_WINDOW_MS
+        ) {
+            sessionNewlyBonded = false
+            AppPrefs.setDeviceMac(appContext, null)
+            setIdle(ErrorInfo(ErrorCause.PAIRING_REJECTED))
+            snack("Pairing failed — open the pairing window from a paired phone first")
             maybeRunPendingTeardown()
             return
         }

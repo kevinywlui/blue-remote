@@ -104,12 +104,20 @@ to **3** bonded phones:
   direct reconnect.
 - **Concurrent connections** — the board advertises while a free slot
   exists (max 3 connections), so one phone using the app never blocks
-  another. Connections that don't authenticate within ~25s are dropped.
+  another. Connections that don't authenticate within ~35s are dropped
+  (longer than the pairing window, so a slow consent dialog is never cut
+  off mid-pairing).
 
 The trade-off vs. passkey pairing: no MITM protection while pairing is
 possible — i.e. during the very first pairing of a fresh board and during
 any deliberately opened 30s window. Open windows at home; the LED shows
-when one is open.
+when one is open. One further caveat inherent to "Just Works" plus an
+address allowlist: an already-bonded phone may re-pair at any time (needed
+for recovery), and BLE pairing does not prove ownership of the identity
+address a peer claims — so an attacker who learns a bonded phone's
+identity address could re-pair as that phone without a window. Identity
+addresses are exchanged encrypted during pairing, not broadcast, which
+keeps this attack impractical rather than impossible.
 
 ### Factory reset
 

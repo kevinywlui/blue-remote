@@ -51,7 +51,10 @@ static const uint32_t COOLDOWN_MS = 2000;      // min gap between pulses
 static const uint32_t RESET_HOLD_MS = 3000;
 static const uint32_t BUTTON_DEBOUNCE_MS = 50; // short-press lower bound
 static const uint32_t PAIRING_WINDOW_MS = 30000;
-static const uint32_t UNAUTH_TIMEOUT_MS = 25000;
+// Longer than the pairing window so a phone that connects as the window
+// opens is never cut off mid-consent-dialog; the window-close sweep evicts
+// unpaired window connections earlier anyway.
+static const uint32_t UNAUTH_TIMEOUT_MS = 35000;
 // Must not exceed MYNEWT_VAL_BLE_STORE_MAX_BONDS (platformio.ini).
 static const size_t MAX_BONDS = 3;
 static const size_t MAX_CONNECTIONS = 3;  // == MYNEWT_VAL_BLE_MAX_CONNECTIONS
@@ -78,7 +81,12 @@ static volatile bool pairWindowOpen = false;
 static uint32_t pairWindowOpenedAt = 0;  // loop-owned
 
 // Identity addresses of bonded peers (the allowlist), capped at MAX_BONDS.
+// Mutated on the NimBLE host task (bond acceptance) AND in loop() (unpair,
+// factory reset), and read from both — every access goes through bondsMux.
+// setup() reserves MAX_BONDS so push_back never allocates inside a critical
+// section; erase/clear don't allocate either.
 static std::vector<NimBLEAddress> knownBonds;
+static portMUX_TYPE bondsMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Management ops that need NVS or multi-step teardown run in loop(), not on
 // the NimBLE host task. Fixed ring; overflow drops the op (logged).
@@ -120,7 +128,9 @@ static bool dequeueOp(PendingOp& out) {
 }
 
 // Connections that never reach an encrypted bonded state are dropped after
-// UNAUTH_TIMEOUT_MS. Slots keyed by connection handle.
+// UNAUTH_TIMEOUT_MS. Slots keyed by connection handle; written from the
+// host task (connect/auth/disconnect) and read/expired from loop(), so
+// accesses share bondsMux.
 struct PeerAuth {
     bool used;
     bool authed;
@@ -130,31 +140,59 @@ struct PeerAuth {
 static PeerAuth authTable[MAX_CONNECTIONS];
 
 static void authTableAdd(uint16_t handle) {
+    portENTER_CRITICAL(&bondsMux);
     for (auto& slot : authTable) {
         if (!slot.used) {
             slot = {true, false, handle, millis()};
-            return;
+            break;
         }
     }
+    portEXIT_CRITICAL(&bondsMux);
 }
 
 static void authTableMark(uint16_t handle) {
+    portENTER_CRITICAL(&bondsMux);
     for (auto& slot : authTable) {
         if (slot.used && slot.handle == handle) slot.authed = true;
     }
+    portEXIT_CRITICAL(&bondsMux);
 }
 
 static void authTableRemove(uint16_t handle) {
+    portENTER_CRITICAL(&bondsMux);
     for (auto& slot : authTable) {
         if (slot.used && slot.handle == handle) slot.used = false;
     }
+    portEXIT_CRITICAL(&bondsMux);
 }
 
 static bool isKnownBond(const NimBLEAddress& addr) {
-    for (const auto& known : knownBonds) {
-        if (known == addr) return true;
+    bool known = false;
+    portENTER_CRITICAL(&bondsMux);
+    for (const auto& bond : knownBonds) {
+        if (bond == addr) {
+            known = true;
+            break;
+        }
     }
-    return false;
+    portEXIT_CRITICAL(&bondsMux);
+    return known;
+}
+
+static size_t bondCount() {
+    portENTER_CRITICAL(&bondsMux);
+    size_t n = knownBonds.size();
+    portEXIT_CRITICAL(&bondsMux);
+    return n;
+}
+
+/** Copy the allowlist into [out] (sized MAX_BONDS); no heap work under the lock. */
+static size_t bondsSnapshot(NimBLEAddress out[]) {
+    portENTER_CRITICAL(&bondsMux);
+    size_t n = knownBonds.size();
+    for (size_t i = 0; i < n; i++) out[i] = knownBonds[i];
+    portEXIT_CRITICAL(&bondsMux);
+    return n;
 }
 
 // NVS key: the identity address as 12 hex chars (NVS keys max 15 chars).
@@ -179,9 +217,17 @@ static void blinkLed(int times, uint32_t periodMs) {
 static void factoryReset() {
     Serial.println("Factory reset: erasing all bonds and names");
     NimBLEDevice::deleteAllBonds();
+    portENTER_CRITICAL(&bondsMux);
     knownBonds.clear();
+    portEXIT_CRITICAL(&bondsMux);
     namesPrefs.clear();
     pairWindowOpen = false;
+    // Formerly bonded phones must not keep a live session on wiped keys.
+    for (int i = server->getConnectedCount() - 1; i >= 0; i--) {
+        NimBLEConnInfo peer = server->getPeerInfo(i);
+        if (peer.getAddress().isNull()) continue;  // raced with a disconnect
+        server->disconnect(peer.getConnHandle());
+    }
     blinkLed(6, 300);  // acknowledge
 }
 
@@ -213,18 +259,28 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 
         // New bond: allowed while the allowlist is empty (first-time setup)
         // or the pairing window is open, and only below the cap.
+        bool accepted = false;
+        size_t total = 0;
+        portENTER_CRITICAL(&bondsMux);
         if ((knownBonds.empty() || pairWindowOpen) && knownBonds.size() < MAX_BONDS) {
-            knownBonds.push_back(peer);
+            knownBonds.push_back(peer);  // capacity reserved: no alloc here
+            accepted = true;
+        }
+        total = knownBonds.size();
+        portEXIT_CRITICAL(&bondsMux);
+        if (accepted) {
             pairWindowOpen = false;  // one new phone per window
             authTableMark(connInfo.getConnHandle());
             Serial.printf("Bonded: %s (%d/%d)\n", peer.toString().c_str(),
-                          (int)knownBonds.size(), (int)MAX_BONDS);
+                          (int)total, (int)MAX_BONDS);
             return;
         }
 
         Serial.printf("Rejecting %s (window closed or allowlist full)\n",
                       peer.toString().c_str());
         server->disconnect(connInfo.getConnHandle());
+        // A single NVS erase on the host task — same as NimBLE's own store
+        // writes during bonding; not worth routing through the op ring.
         NimBLEDevice::deleteBond(peer);
     }
 };
@@ -305,7 +361,11 @@ class MgmtCallbacks : public NimBLECharacteristicCallbacks {
 class BondListCallbacks : public NimBLECharacteristicCallbacks {
     void onRead(NimBLECharacteristic* chr, NimBLEConnInfo& connInfo) override {
         // Serve the real list only to allowlisted phones; others get an
-        // empty (but well-formed) list.
+        // empty (but well-formed) list. Known limitation: the serialized
+        // value persists in the characteristic for ATT blob continuations,
+        // so an encrypted peer in the brief rejected-but-not-yet-dropped
+        // state issuing a first read at offset>0 could see the previous
+        // reader's list — addresses and names only, no keys.
         uint8_t buf[2 + MAX_BONDS * (9 + MAX_NAME_LEN)];
         buf[0] = 1;  // format version
         buf[1] = 0;
@@ -313,8 +373,11 @@ class BondListCallbacks : public NimBLECharacteristicCallbacks {
         if (connInfo.isEncrypted() && connInfo.isBonded() &&
             isKnownBond(connInfo.getIdAddress())) {
             NimBLEAddress self = connInfo.getIdAddress();
-            buf[1] = (uint8_t)knownBonds.size();
-            for (const auto& bond : knownBonds) {
+            NimBLEAddress bonds[MAX_BONDS];
+            size_t count = bondsSnapshot(bonds);  // NVS reads stay unlocked
+            buf[1] = (uint8_t)count;
+            for (size_t b = 0; b < count; b++) {
+                const NimBLEAddress& bond = bonds[b];
                 for (int i = 0; i < 6; i++) buf[len + i] = bond.getBase()->val[5 - i];
                 buf[len + 6] = bond.getBase()->type;
                 buf[len + 7] = (bond == self) ? 0x01 : 0x00;
@@ -332,13 +395,15 @@ class BondListCallbacks : public NimBLECharacteristicCallbacks {
 static void executeUnpair(const uint8_t* entry) {  // 6B display-order + 1B type
     NimBLEAddress target(entry, entry[6]);
     bool found = false;
+    portENTER_CRITICAL(&bondsMux);
     for (auto it = knownBonds.begin(); it != knownBonds.end(); ++it) {
         if (*it == target) {
-            knownBonds.erase(it);
+            knownBonds.erase(it);  // shift only, no alloc
             found = true;
             break;
         }
     }
+    portEXIT_CRITICAL(&bondsMux);
     if (!found) {
         Serial.printf("Unpair: %s not in allowlist; ignored\n", target.toString().c_str());
         return;
@@ -347,10 +412,11 @@ static void executeUnpair(const uint8_t* entry) {  // 6B display-order + 1B type
     namesPrefs.remove(nameKey(target).c_str());
     for (int i = server->getConnectedCount() - 1; i >= 0; i--) {
         NimBLEConnInfo peer = server->getPeerInfo(i);
+        if (peer.getAddress().isNull()) continue;  // raced with a disconnect
         if (peer.getIdAddress() == target) server->disconnect(peer.getConnHandle());
     }
     Serial.printf("Unpaired %s (%d bonds left)\n", target.toString().c_str(),
-                  (int)knownBonds.size());
+                  (int)bondCount());
 }
 
 static void executeSetName(const PendingOp& op) {
@@ -385,7 +451,22 @@ void setup() {
     // Just Works pairing: bonding + LE Secure Connections, no passkey.
     NimBLEDevice::setSecurityAuth(/*bonding=*/true, /*mitm=*/false, /*sc=*/true);
     NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+    // NimBLE's default store-status handler resolves a FULL bond store by
+    // evicting the oldest bond — which would let a stranger pairing outside
+    // the window silently de-key a legitimate phone before our post-auth
+    // rejection runs. The store fills only when the allowlist is full, so
+    // the right answer is to refuse: the extra pairing fails, real bonds
+    // stay intact.
+    ble_hs_cfg.store_status_cb = [](struct ble_store_status_event* event, void*) -> int {
+        if (event->event_code == BLE_STORE_EVENT_FULL ||
+            event->event_code == BLE_STORE_EVENT_OVERFLOW) {
+            Serial.println("Bond store full; refusing eviction");
+            return BLE_HS_EUNKNOWN;
+        }
+        return 0;
+    };
 
+    knownBonds.reserve(MAX_BONDS);  // push_back must never allocate under bondsMux
     for (int i = 0; i < NimBLEDevice::getNumBonds(); i++) {
         knownBonds.push_back(NimBLEDevice::getBondedAddress(i));
     }
@@ -418,7 +499,7 @@ void setup() {
     adv->start();
 
     Serial.printf("Advertising as %s; bonds=%d\n", DEVICE_NAME,
-                  (int)knownBonds.size());
+                  (int)bondCount());
 }
 
 // BOOT button state: millis timestamp when first seen held (0 = not held),
@@ -458,7 +539,7 @@ void loop() {
     // --- Pairing window lifecycle
     if (pairWindowOpenRequested) {
         pairWindowOpenRequested = false;
-        if (knownBonds.size() >= MAX_BONDS) {
+        if (bondCount() >= MAX_BONDS) {
             Serial.println("Pairing window refused: allowlist full");
             blinkLed(3, 200);
         } else {
@@ -479,18 +560,28 @@ void loop() {
         // Evict peers that connected during the window but never paired.
         for (int i = server->getConnectedCount() - 1; i >= 0; i--) {
             NimBLEConnInfo peer = server->getPeerInfo(i);
+            if (peer.getAddress().isNull()) continue;  // raced with a disconnect
             if (!isKnownBond(peer.getIdAddress())) server->disconnect(peer.getConnHandle());
         }
     }
     prevWindowOpen = pairWindowOpen;
 
-    // --- Unauthenticated-peer watchdog
+    // --- Unauthenticated-peer watchdog. Collect stale handles under the
+    // lock, disconnect outside it (host calls must not run in a critical
+    // section).
+    uint16_t staleHandles[MAX_CONNECTIONS];
+    size_t staleCount = 0;
+    portENTER_CRITICAL(&bondsMux);
     for (auto& slot : authTable) {
         if (slot.used && !slot.authed && now - slot.since >= UNAUTH_TIMEOUT_MS) {
-            Serial.printf("Dropping unauthenticated connection (handle %d)\n", slot.handle);
-            server->disconnect(slot.handle);
+            staleHandles[staleCount++] = slot.handle;
             slot.used = false;  // onDisconnect would also clear it
         }
+    }
+    portEXIT_CRITICAL(&bondsMux);
+    for (size_t i = 0; i < staleCount; i++) {
+        Serial.printf("Dropping unauthenticated connection (handle %d)\n", staleHandles[i]);
+        server->disconnect(staleHandles[i]);
     }
 
     // --- Advertising reconciler: advertise while a free slot exists

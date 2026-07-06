@@ -240,7 +240,7 @@ class GarageBleClient(
 
     private sealed interface GattOp {
         data object Trigger : GattOp
-        data class MgmtWrite(val kind: MgmtOp, val payload: ByteArray) : GattOp
+        class MgmtWrite(val kind: MgmtOp, val payload: ByteArray) : GattOp
         data object ListRead : GattOp
     }
 
@@ -295,7 +295,10 @@ class GarageBleClient(
 
     /** This phone's Bluetooth name, truncated to 24 UTF-8 bytes at a codepoint boundary. */
     private fun localNameBytes(): ByteArray {
-        val raw = (runCatching { adapter?.name }.getOrNull() ?: Build.MODEL).trim()
+        // A blank adapter name would register as a CLEAR (0 bytes) — fall
+        // back to the model instead.
+        val raw = (runCatching { adapter?.name }.getOrNull() ?: "").trim()
+            .ifEmpty { Build.MODEL.trim() }
         val sb = StringBuilder()
         var i = 0
         while (i < raw.length) {

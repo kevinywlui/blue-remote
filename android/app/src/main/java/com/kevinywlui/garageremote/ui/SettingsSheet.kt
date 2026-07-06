@@ -47,6 +47,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import com.kevinywlui.garageremote.GarageViewModel
 import com.kevinywlui.garageremote.PairedDevice
 import com.kevinywlui.garageremote.ui.theme.AppTheme
 import com.kevinywlui.garageremote.ui.theme.ThemeSpec
@@ -127,17 +128,25 @@ fun SettingsSheet(
                     )
                 }
                 Spacer(Modifier.height(8.dp))
+                // The board refuses to open the window at capacity; don't
+                // offer an action that would falsely announce success.
+                val listFull = pairedDevices.size >= GarageViewModel.MAX_BONDS
                 OutlinedButton(
                     onClick = onPairNewPhone,
-                    enabled = connected,
+                    enabled = connected && !listFull,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text("Pair another phone")
                 }
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    "Opens a 30-second window during which one new phone can pair " +
-                        "— the same window a short press of the board's BOOT button opens.",
+                    if (listFull) {
+                        "The board holds up to ${GarageViewModel.MAX_BONDS} phones — " +
+                            "remove one before pairing another."
+                    } else {
+                        "Opens a 30-second window during which one new phone can pair " +
+                            "— the same window a short press of the board's BOOT button opens."
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
