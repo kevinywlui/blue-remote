@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Warm off-white behind the door emoji foreground. -->
-    <color name="ic_launcher_background">#FFF8F0</color>
+    <!-- Soft light blue behind the blue bicycle foreground. -->
+    <color name="ic_launcher_background">#E8F0FE</color>
 </resources>

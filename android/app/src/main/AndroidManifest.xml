@@ -23,7 +23,7 @@
         android:required="true" />
 
     <application
-        android:label="Garage Remote"
+        android:label="Blue Remote"
         android:icon="@mipmap/ic_launcher"
         android:theme="@style/Theme.GarageRemote">
         <activity
