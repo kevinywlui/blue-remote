@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Refresh
@@ -86,6 +87,7 @@ class MainScreenActions(
     val openAppSettings: () -> Unit,
     val openLocationSettings: () -> Unit,
     val openSettingsSheet: () -> Unit,
+    val openRemoteSheet: () -> Unit,
 )
 
 @Composable
@@ -129,7 +131,11 @@ fun MainScreen(vm: GarageViewModel, actions: MainScreenActions) {
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center,
             ) {
-                StatusChip(state, reducedMotion, onRetry = { vm.connect() })
+                StatusChip(
+                    state, reducedMotion,
+                    onRetry = { vm.connect() },
+                    onOpenDetails = actions.openRemoteSheet,
+                )
                 SecondaryDetail(state)
                 Spacer(Modifier.height(40.dp))
                 BigButton(vm, state, reducedMotion, actions)
@@ -146,6 +152,10 @@ private data class ChipSpec(
     val pulse: Boolean = false,
     val warn: Boolean = false,
     val retryTarget: Boolean = false,
+    // Ready only: tapping the chip opens the "This remote" sheet. Mutually
+    // exclusive with retryTarget so the chip carries exactly one meaning per
+    // state — never both "Retry" and "open details".
+    val detailsTarget: Boolean = false,
 )
 
 @Composable
@@ -163,7 +173,9 @@ private fun chipSpec(state: UiState): ChipSpec {
             "Confirm pairing — check the dialog or your notification shade",
             scheme.secondaryContainer, scheme.onSecondaryContainer, spinner = true,
         )
-        is UiState.Ready -> ChipSpec("Connected", ext.successContainer, ext.onSuccessContainer)
+        is UiState.Ready -> ChipSpec(
+            "Connected", ext.successContainer, ext.onSuccessContainer, detailsTarget = true,
+        )
         // TRIGGERING and COOLDOWN share one label so the liveRegion fires
         // once per press (§3/§5).
         UiState.Triggering, UiState.Cooldown ->
@@ -186,7 +198,12 @@ private fun chipErrorLabel(cause: ErrorCause): String = when (cause) {
 }
 
 @Composable
-private fun StatusChip(state: UiState, reducedMotion: Boolean, onRetry: () -> Unit) {
+private fun StatusChip(
+    state: UiState,
+    reducedMotion: Boolean,
+    onRetry: () -> Unit,
+    onOpenDetails: () -> Unit,
+) {
     val spec = chipSpec(state)
     val pulseAlpha = if (spec.pulse && !reducedMotion) {
         rememberInfiniteTransition(label = "pulse").animateFloat(
@@ -208,14 +225,19 @@ private fun StatusChip(state: UiState, reducedMotion: Boolean, onRetry: () -> Un
         modifier = Modifier
             .semantics(mergeDescendants = true) { liveRegion = LiveRegionMode.Polite }
             .then(
-                if (spec.retryTarget) {
-                    // The whole chip is the retry target (32dp chip vs 48dp rule).
-                    Modifier
+                // The chip is a tap target in exactly two states, never both:
+                // Retry when disconnected/error, open-details when Ready. The
+                // 32dp chip is padded to the 48dp target rule either way.
+                when {
+                    spec.retryTarget -> Modifier
                         .minimumInteractiveComponentSize()
                         .clip(CircleShape)
                         .clickable(onClickLabel = "Retry connection", onClick = onRetry)
-                } else {
-                    Modifier
+                    spec.detailsTarget -> Modifier
+                        .minimumInteractiveComponentSize()
+                        .clip(CircleShape)
+                        .clickable(onClickLabel = "open remote details", onClick = onOpenDetails)
+                    else -> Modifier
                 },
             ),
     ) {
@@ -248,6 +270,15 @@ private fun ChipContent(spec: ChipSpec, pulseAlpha: Float) {
         }
         Spacer(Modifier.width(8.dp))
         Text(spec.label, style = MaterialTheme.typography.labelLarge)
+        if (spec.detailsTarget) {
+            // Affordance that the connected chip is tappable → "This remote".
+            // Decorative; the chip's onClick label already names the action.
+            Spacer(Modifier.width(4.dp))
+            Icon(
+                Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                contentDescription = null, modifier = Modifier.size(18.dp),
+            )
+        }
     }
 }
 

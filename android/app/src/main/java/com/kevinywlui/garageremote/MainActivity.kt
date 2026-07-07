@@ -30,6 +30,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import com.kevinywlui.garageremote.ui.MainScreen
 import com.kevinywlui.garageremote.ui.MainScreenActions
+import com.kevinywlui.garageremote.ui.RemoteSheet
 import com.kevinywlui.garageremote.ui.SettingsSheet
 import com.kevinywlui.garageremote.ui.theme.GarageTheme
 import com.kevinywlui.garageremote.ui.theme.resolveTheme
@@ -85,8 +86,10 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun Root() {
         // Saveable: follow-system makes uiMode recreation routine; it must
-        // not close the sheet.
-        var sheetOpen by rememberSaveable { mutableStateOf(false) }
+        // not close a sheet. The two sheets are mutually exclusive entry
+        // points — gear → Settings (theme), connected chip → This remote.
+        var settingsOpen by rememberSaveable { mutableStateOf(false) }
+        var remoteOpen by rememberSaveable { mutableStateOf(false) }
         // First launch goes straight to the permission request; recreations
         // (and later denials) recover via the in-screen affordances instead.
         var permissionsRequested by rememberSaveable { mutableStateOf(false) }
@@ -100,7 +103,8 @@ class MainActivity : ComponentActivity() {
                     vm.notifySystemActivityLaunched()
                     systemActivityLauncher.launch(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
                 },
-                openSettingsSheet = { sheetOpen = true },
+                openSettingsSheet = { settingsOpen = true },
+                openRemoteSheet = { remoteOpen = true },
             )
         }
 
@@ -110,18 +114,24 @@ class MainActivity : ComponentActivity() {
                 permissionLauncher.launch(GarageViewModel.requiredPermissions())
             }
         }
-        // Drives the bond-list refresh + poll while the sheet is visible.
-        LaunchedEffect(sheetOpen) { vm.onPhonesSheetVisible(sheetOpen) }
+        // Drives the bond-list refresh + poll while the "This remote" sheet
+        // (the only phone-list surface) is visible.
+        LaunchedEffect(remoteOpen) { vm.onPhonesSheetVisible(remoteOpen) }
 
         MainScreen(vm, actions)
-        if (sheetOpen) {
+        if (settingsOpen) {
             val theme by vm.theme.collectAsState()
-            val state by vm.uiState.collectAsState()
-            val phonesAvailable by vm.phonesAvailable.collectAsState()
-            val pairedDevices by vm.pairedDevices.collectAsState()
             SettingsSheet(
                 currentTheme = theme,
                 onThemeSelected = { vm.setTheme(it) },
+                onDismiss = { settingsOpen = false },
+            )
+        }
+        if (remoteOpen) {
+            val state by vm.uiState.collectAsState()
+            val phonesAvailable by vm.phonesAvailable.collectAsState()
+            val pairedDevices by vm.pairedDevices.collectAsState()
+            RemoteSheet(
                 phonesAvailable = phonesAvailable,
                 connected = state is UiState.Ready,
                 pairedDevices = pairedDevices,
@@ -129,10 +139,10 @@ class MainActivity : ComponentActivity() {
                     vm.openPairingWindow()
                     // The result snackbar renders in MainScreen's Scaffold,
                     // which the modal sheet would cover.
-                    sheetOpen = false
+                    remoteOpen = false
                 },
                 onUnpair = { vm.unpair(it) },
-                onDismiss = { sheetOpen = false },
+                onDismiss = { remoteOpen = false },
             )
         }
     }
