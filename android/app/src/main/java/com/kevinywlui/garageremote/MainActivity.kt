@@ -110,13 +110,28 @@ class MainActivity : ComponentActivity() {
                 permissionLauncher.launch(GarageViewModel.requiredPermissions())
             }
         }
+        // Drives the bond-list refresh + poll while the sheet is visible.
+        LaunchedEffect(sheetOpen) { vm.onPhonesSheetVisible(sheetOpen) }
 
         MainScreen(vm, actions)
         if (sheetOpen) {
             val theme by vm.theme.collectAsState()
+            val state by vm.uiState.collectAsState()
+            val phonesAvailable by vm.phonesAvailable.collectAsState()
+            val pairedDevices by vm.pairedDevices.collectAsState()
             SettingsSheet(
                 currentTheme = theme,
                 onThemeSelected = { vm.setTheme(it) },
+                phonesAvailable = phonesAvailable,
+                connected = state is UiState.Ready,
+                pairedDevices = pairedDevices,
+                onPairNewPhone = {
+                    vm.openPairingWindow()
+                    // The result snackbar renders in MainScreen's Scaffold,
+                    // which the modal sheet would cover.
+                    sheetOpen = false
+                },
+                onUnpair = { vm.unpair(it) },
                 onDismiss = { sheetOpen = false },
             )
         }
